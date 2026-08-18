@@ -1,0 +1,197 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if $spec.enabled }}
+{{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+{{- $uid := required (printf "components.%s.security.uid is required" $name) $spec.security.uid }}
+{{- $gid := required (printf "components.%s.security.gid is required" $name) $spec.security.gid }}
+{{- $secretName := include "generic-stack.secretName" (dict "root" $ "name" $name "spec" $spec) }}
+{{- $hasFiles := and $spec.files $spec.filesMountPath }}
+---
+apiVersion: apps/v1
+kind: {{ $spec.kind }}
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+spec:
+  replicas: {{ $spec.replicas }}
+  selector:
+    matchLabels:
+      {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+  {{- if eq $spec.kind "StatefulSet" }}
+  serviceName: {{ $fullname }}-hl
+  {{- with $spec.strategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- else }}
+  {{- if $spec.strategy }}
+  strategy:
+    {{- toYaml $spec.strategy | nindent 4 }}
+  {{- else if $spec.persistence.enabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 8 }}
+        {{- with $spec.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include "generic-stack.configChecksum" (dict "root" $ "spec" $spec) }}
+        {{- with $spec.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: {{ $spec.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ $spec.terminationGracePeriodSeconds }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- $podSec := dict "runAsNonRoot" true "runAsUser" $uid "runAsGroup" $gid "fsGroup" $gid "fsGroupChangePolicy" "OnRootMismatch" "seccompProfile" (dict "type" "RuntimeDefault") }}
+        {{- mustMergeOverwrite $podSec (deepCopy $spec.podSecurityContext) | toYaml | nindent 8 }}
+      {{- with $spec.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $spec.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $spec.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $spec.initContainers }}
+      initContainers:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "generic-stack.image" (dict "root" $ "name" $name "spec" $spec) }}
+          imagePullPolicy: {{ $spec.image.pullPolicy }}
+          {{- with $spec.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $spec.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- $ctrSec := dict "readOnlyRootFilesystem" true "allowPrivilegeEscalation" false "capabilities" (dict "drop" (list "ALL")) }}
+            {{- mustMergeOverwrite $ctrSec (deepCopy $spec.containerSecurityContext) | toYaml | nindent 12 }}
+          ports:
+            - name: {{ $spec.ports.main.name }}
+              containerPort: {{ $spec.ports.main.containerPort }}
+              protocol: {{ $spec.ports.main.protocol | default "TCP" }}
+            - name: {{ $spec.ports.admin.name }}
+              containerPort: {{ $spec.ports.admin.containerPort }}
+              protocol: TCP
+            {{- range $spec.ports.extra }}
+            - name: {{ .name }}
+              containerPort: {{ .containerPort }}
+              protocol: {{ .protocol | default "TCP" }}
+            {{- end }}
+          {{- if or $spec.env $spec.secretEnv }}
+          env:
+            {{- range $k, $v := $spec.env }}
+            - name: {{ $k }}
+              value: {{ tpl (toString $v) $ | quote }}
+            {{- end }}
+            {{- range $k, $key := $spec.secretEnv }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ $key }}
+            {{- end }}
+          {{- end }}
+          {{- if $spec.probes.startup.enabled }}
+          startupProbe:
+            {{- include "generic-stack.probe" (dict "path" "/startupz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.startup) | nindent 12 }}
+          {{- end }}
+          {{- if $spec.probes.liveness.enabled }}
+          livenessProbe:
+            {{- include "generic-stack.probe" (dict "path" "/livez" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.liveness) | nindent 12 }}
+          {{- end }}
+          {{- if $spec.probes.readiness.enabled }}
+          readinessProbe:
+            {{- include "generic-stack.probe" (dict "path" "/readyz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.readiness) | nindent 12 }}
+          {{- end }}
+          {{- with $spec.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if $hasFiles }}
+            - name: files
+              mountPath: {{ $spec.filesMountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if $spec.secretMount.enabled }}
+            - name: secret
+              mountPath: {{ $spec.secretMount.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if $spec.persistence.mountPath }}
+            - name: data
+              mountPath: {{ $spec.persistence.mountPath }}
+              {{- with $spec.persistence.subPath }}
+              subPath: {{ . }}
+              {{- end }}
+            {{- end }}
+            {{- with $spec.extraVolumeMounts }}
+            {{- tpl (toYaml .) $ | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $hasFiles }}
+        - name: files
+          configMap:
+            name: {{ $fullname }}
+        {{- end }}
+        {{- if $spec.secretMount.enabled }}
+        - name: secret
+          secret:
+            secretName: {{ $secretName }}
+        {{- end }}
+        {{- if $spec.persistence.mountPath }}
+        {{- if and $spec.persistence.enabled (eq $spec.kind "Deployment") }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-data
+        {{- else if not $spec.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- end }}
+        {{- with $spec.extraVolumes }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+  {{- if and (eq $spec.kind "StatefulSet") $spec.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml $spec.persistence.accessModes | nindent 10 }}
+        {{- $sc := $spec.persistence.storageClass | default $.Values.global.storageClass }}
+        {{- if $sc }}
+        storageClassName: {{ $sc }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $spec.persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

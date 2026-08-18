@@ -1,0 +1,23 @@
+#!/bin/sh
+echo `# <#` >/dev/null
+# ---------------------------------- POSIX sh ----------------------------------
+set -eu
+VCS_REF=$(git rev-parse --short HEAD 2>/dev/null || echo adhoc)
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+podman manifest rm localhost/user-mgmt-service:0.0.1 >/dev/null 2>&1 || true
+podman build --platform linux/amd64 -t localhost/user-mgmt-service:0.0.1-amd64 --build-arg VCS_REF="$VCS_REF" --build-arg BUILD_DATE="$BUILD_DATE" -f Containerfile .
+podman build --platform linux/arm64 -t localhost/user-mgmt-service:0.0.1-arm64 --build-arg VCS_REF="$VCS_REF" --build-arg BUILD_DATE="$BUILD_DATE" --build-arg TOOLCHAIN_IMAGE=ghcr.io/graalvm/native-image-community:25i2-25.0.4-ol9-20260728@sha256:134459d7bf12fbc00668691b67fdd36642b16d3ed2138654260c40abd627685c --build-arg RUNTIME_IMAGE=quay.io/almalinuxorg/10-micro:10.2@sha256:e51f782590ad149fedcf80bea4bc9cd92046859aa5c755f87cddca8d835a6c21 --build-arg NATIVE_LINK_ARGS=--static-nolibc -f Containerfile .
+podman manifest create localhost/user-mgmt-service:0.0.1
+podman manifest add localhost/user-mgmt-service:0.0.1 containers-storage:localhost/user-mgmt-service:0.0.1-amd64
+exec podman manifest add localhost/user-mgmt-service:0.0.1 containers-storage:localhost/user-mgmt-service:0.0.1-arm64
+#> >$null
+# --------------------------------- PowerShell ---------------------------------
+$VCS_REF = 'adhoc'
+try { $r = git rev-parse --short HEAD 2>$null; if ($LASTEXITCODE -eq 0 -and $r) { $VCS_REF = "$r".Trim() } } catch { }
+$BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+try { podman manifest rm localhost/user-mgmt-service:0.0.1 2>$null | Out-Null } catch { }
+podman build --platform linux/amd64 -t localhost/user-mgmt-service:0.0.1-amd64 --build-arg VCS_REF=$VCS_REF --build-arg BUILD_DATE=$BUILD_DATE -f Containerfile .
+if ($LASTEXITCODE -eq 0) { podman build --platform linux/arm64 -t localhost/user-mgmt-service:0.0.1-arm64 --build-arg VCS_REF=$VCS_REF --build-arg BUILD_DATE=$BUILD_DATE --build-arg TOOLCHAIN_IMAGE=ghcr.io/graalvm/native-image-community:25i2-25.0.4-ol9-20260728@sha256:134459d7bf12fbc00668691b67fdd36642b16d3ed2138654260c40abd627685c --build-arg RUNTIME_IMAGE=quay.io/almalinuxorg/10-micro:10.2@sha256:e51f782590ad149fedcf80bea4bc9cd92046859aa5c755f87cddca8d835a6c21 --build-arg NATIVE_LINK_ARGS=--static-nolibc -f Containerfile . }
+if ($LASTEXITCODE -eq 0) { podman manifest create localhost/user-mgmt-service:0.0.1 }
+if ($LASTEXITCODE -eq 0) { podman manifest add localhost/user-mgmt-service:0.0.1 containers-storage:localhost/user-mgmt-service:0.0.1-amd64 }
+if ($LASTEXITCODE -eq 0) { podman manifest add localhost/user-mgmt-service:0.0.1 containers-storage:localhost/user-mgmt-service:0.0.1-arm64 }

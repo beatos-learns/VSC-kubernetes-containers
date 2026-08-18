@@ -1,0 +1,106 @@
+diff --git a/app/(auth)/signup/page.tsx b/app/(auth)/signup/page.tsx
+index 6861a09..2826b4e 100644
+--- a/app/(auth)/signup/page.tsx
++++ b/app/(auth)/signup/page.tsx
+@@ -9,9 +9,8 @@ export default function SignupPage() {
+     const router = useRouter();
+ 
+     const handleSignup = async (data: SignupFormValues) => {
+-        const api_url = process.env.NEXT_PUBLIC_API_URL + "/users/register";
+         const userRegisterDTO : UserRegisterDTO = (({ confirmPassword, ...dto }) => dto)(data);
+-        const response = await fetch(api_url, {
++        const response = await fetch("/api/signup", {
+             method: "POST",
+             headers: {
+                 "Content-Type": "application/json",
+diff --git a/app/api/login/route.ts b/app/api/login/route.ts
+index d00af25..291270a 100644
+--- a/app/api/login/route.ts
++++ b/app/api/login/route.ts
+@@ -4,7 +4,7 @@ export async function POST(req: Request) {
+   try {
+     const body = await req.json()
+ 
+-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/login`, {
++    const res = await fetch(`${process.env.API_URL}/users/login`, {
+       method: "POST",
+       headers: {
+         "Content-Type": "application/json",
+@@ -32,7 +32,7 @@ export async function POST(req: Request) {
+     response.cookies.set("jwt", token, {
+       httpOnly: true,
+       sameSite: "lax",
+-      secure: false,
++      secure: process.env.COOKIE_SECURE !== "false",
+       path: "/",
+       maxAge: 60 * 60 * 24 * 7
+     })
+diff --git a/app/api/me/route.ts b/app/api/me/route.ts
+index e9b8d3b..078b9c7 100644
+--- a/app/api/me/route.ts
++++ b/app/api/me/route.ts
+@@ -7,7 +7,7 @@ export async function GET() {
+     return Response.json({ error: "Unauthorized" }, { status: 401 })
+   }
+ 
+-  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/me`, {
++  const res = await fetch(`${process.env.API_URL}/users/me`, {
+     method: "GET",
+     headers: {
+       Authorization: `Bearer ${token}`,
+diff --git a/app/api/signup/route.ts b/app/api/signup/route.ts
+new file mode 100644
+index 0000000..7db59b7
+--- /dev/null
++++ b/app/api/signup/route.ts
+@@ -0,0 +1,24 @@
++import { NextResponse } from "next/server"
++
++export async function POST(req: Request) {
++  try {
++    const body = await req.json()
++
++    const res = await fetch(`${process.env.API_URL}/users/register`, {
++      method: "POST",
++      headers: {
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify(body),
++    })
++
++    const data = await res.json().catch(() => null)
++
++    return NextResponse.json(data ?? {}, { status: res.status })
++  } catch (err) {
++    return NextResponse.json(
++        { message: "Server error" },
++        { status: 502 }
++    )
++  }
++}
+diff --git a/components/ui/cardHorizontalDemo.tsx b/components/ui/cardHorizontalDemo.tsx
+index 18dcc5a..db61a40 100644
+--- a/components/ui/cardHorizontalDemo.tsx
++++ b/components/ui/cardHorizontalDemo.tsx
+@@ -12,7 +12,7 @@ const CardHorizontalDemo = () => {
+       <CardFooter className='justify-between gap-3 max-sm:flex-col max-sm:items-stretch'>
+         <div className='flex items-center gap-3'>
+           <Avatar className='ring-ring ring-2'>
+-            <AvatarImage src='https://cdn.shadcnstudio.com/ss-assets/avatar/avatar-5.png' alt='Hallie Richards' />
++            <AvatarImage src='/astronaut.webp' alt='Hallie Richards' />
+             <AvatarFallback className='text-xs'>SG</AvatarFallback>
+           </Avatar>
+           <div className='flex flex-col gap-0.5'>
+diff --git a/next.config.ts b/next.config.ts
+index e9ffa30..68a6c64 100644
+--- a/next.config.ts
++++ b/next.config.ts
+@@ -1,7 +1,7 @@
+ import type { NextConfig } from "next";
+ 
+ const nextConfig: NextConfig = {
+-  /* config options here */
++  output: "standalone",
+ };
+ 
+ export default nextConfig;

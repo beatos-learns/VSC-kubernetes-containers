@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+ARG APP_UID=10021
+ARG APP_GID=10021
+ARG VERSION=0.0.1-SNAPSHOT
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+ARG SOURCE_COMMIT=747b7f4e3d1f09cc4434a75d9c991ea091fda548
+ARG TOOLCHAIN_IMAGE=ghcr.io/graalvm/native-image-community:25i2-25.0.4-muslib-ol9-20260728@sha256:6e37595f3867f59afa8f0cf2ed6a656a9faa7287c9178f919be1077cfac5003c
+ARG RUNTIME_IMAGE=scratch
+ARG NATIVE_LINK_ARGS="--static --libc=musl"
+
+# ---------------------------------------------------------------------------
+FROM ${TOOLCHAIN_IMAGE} AS build
+ARG SOURCE_COMMIT
+ARG NATIVE_LINK_ARGS
+ENV NATIVE_LINK_ARGS=${NATIVE_LINK_ARGS}
+RUN microdnf install -y git unzip && microdnf clean all
+ADD https://services.gradle.org/distributions/gradle-9.0.0-bin.zip /opt/gradle.zip
+RUN echo "8fad3d78296ca518113f3d29016617c7f9367dc005f932bd9d93bf45ba46072b /opt/gradle.zip" | sha256sum -c - \
+ && unzip -q /opt/gradle.zip -d /opt \
+ && rm /opt/gradle.zip
+WORKDIR /src
+RUN git init -q . \
+ && git remote add origin https://github.com/yagan93/user_mgmt_service.git \
+ && git fetch -q --depth 1 origin ${SOURCE_COMMIT} \
+ && git checkout -q FETCH_HEAD
+COPY patches/ /patches/
+RUN git apply /patches/*.patch
+RUN --mount=type=cache,target=/root/.gradle /opt/gradle-9.0.0/bin/gradle --no-daemon nativeCompile
+RUN install -d -m 1777 /skel/tmp
+
+# ---------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE}
+ARG APP_UID
+ARG APP_GID
+ARG VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="user-mgmt-service" \
+      org.opencontainers.image.source="https://github.com/yagan93/user_mgmt_service" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+COPY --from=build --chown=${APP_UID}:${APP_GID} /skel/ /
+COPY --from=build --chown=${APP_UID}:${APP_GID} /src/build/native/nativeCompile/user-mgmt-service /app/user-mgmt-service
+ENV APP_VERSION=${VERSION} \
+    APP_REVISION=${VCS_REF}
+USER ${APP_UID}:${APP_GID}
+EXPOSE 8080 9090
+ENTRYPOINT ["/app/user-mgmt-service"]

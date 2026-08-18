@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+ARG APP_UID=10020
+ARG APP_GID=10020
+ARG VERSION=16.15
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+ARG TARGETARCH
+
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS supervisor
+ARG TARGETARCH
+WORKDIR /src
+COPY supervisor/ /src/
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/pgsupervisor .
+
+# ---------------------------------------------------------------------------
+FROM docker.io/library/almalinux:10.2-minimal@sha256:bafd259fb7b0475eed28376ddddea19f209e24efafc9eb21f4e9d5ed9825d2ef AS rootfs
+ARG APP_UID
+ARG APP_GID
+RUN case "$(uname -m)" in \
+      x86_64) REPO_SUM=47cc6e0243230a0ebe79552ed932688ce58552bbc570e19b0888b3e8c88a66c7 ;; \
+      aarch64) REPO_SUM=a5c3355fb7667ccbba2d0f31ada02a658101ebdfe4aa384317070d9ae1890c31 ;; \
+      *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/pgdg-key "https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL" \
+ && echo "a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe5453 /tmp/pgdg-key" | sha256sum -c - \
+ && rpm --import /tmp/pgdg-key \
+ && curl -fsSL -o /tmp/pgdg.rpm "https://download.postgresql.org/pub/repos/yum/reporpms/EL-10-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm" \
+ && echo "${REPO_SUM} /tmp/pgdg.rpm" | sha256sum -c - \
+ && rpm -i /tmp/pgdg.rpm \
+ && rm /tmp/pgdg.rpm /tmp/pgdg-key
+RUN mkdir -p /rootfs \
+ && microdnf -y --installroot=/rootfs --releasever=10 --nodocs \
+      --noplugins --config=/etc/dnf/dnf.conf \
+      --setopt=cachedir=/var/cache/microdnf-rootfs \
+      --setopt=reposdir=/etc/yum.repos.d \
+      --setopt=varsdir=/etc/dnf/vars \
+      --setopt=install_weak_deps=0 \
+      install postgresql16-server-16.15-1PGDG.rhel10.2 \
+ && rm -rf /var/cache/microdnf-rootfs /rootfs/var/cache/* /rootfs/var/lib/dnf /rootfs/usr/share/man \
+      /rootfs/usr/share/doc /rootfs/usr/share/info /rootfs/usr/share/locale \
+      /rootfs/etc/yum.repos.d /rootfs/tmp/*
+RUN sed -i '/^postgres:/d' /rootfs/etc/passwd \
+ && sed -i '/^postgres:/d' /rootfs/etc/group \
+ && echo "postgres:x:${APP_UID}:${APP_GID}::/var/lib/postgresql:/usr/sbin/nologin" >> /rootfs/etc/passwd \
+ && echo "postgres:x:${APP_GID}:" >> /rootfs/etc/group \
+ && install -d -m 1777 /rootfs/tmp \
+ && install -d -m 750 -o ${APP_UID} -g ${APP_GID} /rootfs/var/lib/postgresql \
+ && install -d -m 700 -o ${APP_UID} -g ${APP_GID} /rootfs/var/lib/postgresql/data \
+ && install -d -m 755 /rootfs/docker-entrypoint-initdb.d
+
+# ---------------------------------------------------------------------------
+FROM scratch
+ARG APP_UID
+ARG APP_GID
+ARG VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="postgresql" \
+      org.opencontainers.image.source="https://www.postgresql.org/" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+COPY --from=rootfs /rootfs/ /
+COPY --from=supervisor /out/pgsupervisor /usr/local/bin/pgsupervisor
+ENV PATH="/usr/pgsql-16/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin" \
+    LANG=C.UTF-8 \
+    PGDATA=/var/lib/postgresql/data \
+    APP_VERSION=${VERSION} \
+    APP_REVISION=${VCS_REF}
+USER ${APP_UID}:${APP_GID}
+EXPOSE 5432 9090
+ENTRYPOINT ["/usr/local/bin/pgsupervisor"]

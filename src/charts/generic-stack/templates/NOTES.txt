@@ -1,0 +1,12 @@
+{{ .Chart.Name }}-{{ .Chart.Version }} deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Components:
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if $spec.enabled }}
+  {{ printf "%-10s" $name }} {{ include "generic-stack.image" (dict "root" $ "name" $name "spec" $spec) }} ({{ $spec.kind }}, service {{ include "generic-stack.componentName" (dict "root" $ "name" $name) }})
+{{- end }}
+{{- end }}
+
+See the chart's CONTRACT.md for the full values surface and the settings every
+deployment must provide (secret material, registry credentials, seed SQL).

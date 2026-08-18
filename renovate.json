@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "helm-values": { "enabled": false },
+  "packageRules": [
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "base images"
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchFileNames": ["src/*/buildCommand"],
+      "groupName": "base images"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["^src/[^/]+/buildCommand$"],
+      "matchStrings": [
+        "--build-arg [A-Z_]+_IMAGE=(?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
+      "matchStrings": [
+        "raw\\.githubusercontent\\.com/(?<depName>[^/]+/[^/]+)/main/(?:contrib/)?install\\.sh \\| sh -s -- -b \\S+ (?<currentValue>v[0-9][0-9.]*)",
+        "github\\.com/(?<depName>[^/]+/[^/]+)/releases/download/(?<currentValue>v[0-9][0-9.]*)/"
+      ],
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}

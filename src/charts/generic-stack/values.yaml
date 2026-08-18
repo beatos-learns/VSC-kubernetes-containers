@@ -1,0 +1,213 @@
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  imageRegistry: ghcr.io/beatos-learns/vsc-kubernetes-containers
+  imagePullSecrets: []
+  storageClass: ""
+
+nameOverride: ""
+commonLabels: {}
+extraObjects: []
+
+# ---------------------------------------------------------------------------
+# Component defaults (deep-merged under every component)
+# ---------------------------------------------------------------------------
+componentDefaults:
+  enabled: true
+  kind: Deployment
+  replicas: 1
+  image:
+    registry: ""
+    repository: ""
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  security:
+    uid: null
+    gid: null
+  ports:
+    main:
+      name: http
+      containerPort: 8080
+      servicePort: 8080
+      protocol: TCP
+    admin:
+      name: admin
+      containerPort: 9090
+    extra: []
+  env: {}
+  secretEnv: {}
+  existingSecret: ""
+  secret: {}
+  secretMount:
+    enabled: false
+    mountPath: /run/secrets
+  files: {}
+  filesMountPath: ""
+  persistence:
+    enabled: false
+    mountPath: ""
+    subPath: ""
+    size: 1Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: ""
+  service:
+    enabled: true
+    type: ClusterIP
+    annotations: {}
+    exposeAdmin: false
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    tls: []
+  probes:
+    startup:
+      enabled: true
+      periodSeconds: 5
+      failureThreshold: 36
+      timeoutSeconds: 2
+    liveness:
+      enabled: true
+      periodSeconds: 10
+      failureThreshold: 3
+      timeoutSeconds: 2
+    readiness:
+      enabled: true
+      periodSeconds: 5
+      failureThreshold: 2
+      timeoutSeconds: 2
+  resources: {}
+  strategy: {}
+  terminationGracePeriodSeconds: 30
+  automountServiceAccountToken: false
+  podSecurityContext: {}
+  containerSecurityContext: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  command: []
+  args: []
+  initContainers: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+components:
+  db:
+    kind: StatefulSet
+    image:
+      repository: postgresql
+      tag: "0.0.1"
+    security:
+      uid: 10020
+      gid: 10020
+    ports:
+      main:
+        name: postgresql
+        containerPort: 5432
+        servicePort: 5432
+        protocol: TCP
+    env:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD_FILE: /run/secrets/db-password
+    secretMount:
+      enabled: true
+    filesMountPath: /docker-entrypoint-initdb.d
+    persistence:
+      enabled: true
+      mountPath: /var/lib/postgresql
+      size: 2Gi
+    probes:
+      startup:
+        failureThreshold: 60
+    terminationGracePeriodSeconds: 45
+
+  backend:
+    image:
+      repository: user-mgmt-service
+      tag: "0.0.1"
+    security:
+      uid: 10021
+      gid: 10021
+    ports:
+      main:
+        name: http
+        containerPort: 8080
+        servicePort: 8080
+        protocol: TCP
+    env:
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ .Release.Name }}-db:5432/app"
+      SPRING_DATASOURCE_USERNAME: app
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      JWT_ISSUER: user-mgmt-service
+      JWT_EXPIRATION_MILLIS: "3600000"
+    secretEnv:
+      SPRING_DATASOURCE_PASSWORD: db-password
+      JWT_SECRET: jwt-secret
+    terminationGracePeriodSeconds: 20
+
+  frontend:
+    image:
+      repository: auth-portal
+      tag: "0.0.1"
+    security:
+      uid: 10022
+      gid: 10022
+    ports:
+      main:
+        name: http
+        containerPort: 3000
+        servicePort: 3000
+        protocol: TCP
+    env:
+      API_URL: "http://{{ .Release.Name }}-backend:8080"
+    terminationGracePeriodSeconds: 20
+
+  proxy:
+    image:
+      repository: traefik
+      tag: "0.0.1"
+    security:
+      uid: 10023
+      gid: 10023
+    ports:
+      main:
+        name: web
+        containerPort: 8080
+        servicePort: 80
+        protocol: TCP
+      extra:
+        - name: websecure
+          containerPort: 8443
+          servicePort: 443
+          protocol: TCP
+    files:
+      routes.yaml: |
+        http:
+          routers:
+            app:
+              rule: PathPrefix(`/`)
+              entryPoints:
+                - web
+              service: frontend
+          services:
+            frontend:
+              loadBalancer:
+                servers:
+                  - url: "http://{{ .Release.Name }}-frontend:3000"
+    filesMountPath: /etc/traefik/dynamic
+    persistence:
+      enabled: false
+      mountPath: /data
+    service:
+      type: LoadBalancer
+    terminationGracePeriodSeconds: 25

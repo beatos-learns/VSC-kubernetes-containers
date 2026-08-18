@@ -1,0 +1,41 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.ingress.enabled }}
+{{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+  {{- with $spec.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $spec.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with $spec.ingress.tls }}
+  tls:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $spec.ingress.hosts }}
+    - host: {{ tpl .host $ | quote }}
+      http:
+        paths:
+          {{- range .paths | default (list (dict "path" "/" "pathType" "Prefix")) }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  number: {{ $spec.ports.main.servicePort | default $spec.ports.main.containerPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

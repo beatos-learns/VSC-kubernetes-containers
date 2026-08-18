@@ -1,0 +1,199 @@
+diff --git a/app/(auth)/signup/page.tsx b/app/(auth)/signup/page.tsx
+index 6861a09..2826b4e 100644
+--- a/app/(auth)/signup/page.tsx
++++ b/app/(auth)/signup/page.tsx
+@@ -9,9 +9,8 @@ export default function SignupPage() {
+     const router = useRouter();
+ 
+     const handleSignup = async (data: SignupFormValues) => {
+-        const api_url = process.env.NEXT_PUBLIC_API_URL + "/users/register";
+         const userRegisterDTO : UserRegisterDTO = (({ confirmPassword, ...dto }) => dto)(data);
+-        const response = await fetch(api_url, {
++        const response = await fetch("/api/signup", {
+             method: "POST",
+             headers: {
+                 "Content-Type": "application/json",
+diff --git a/app/api/login/route.ts b/app/api/login/route.ts
+deleted file mode 100644
+index d00af25..0000000
+--- a/app/api/login/route.ts
++++ /dev/null
+@@ -1,47 +0,0 @@
+-import { NextResponse } from "next/server"
+-
+-export async function POST(req: Request) {
+-  try {
+-    const body = await req.json()
+-
+-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/login`, {
+-      method: "POST",
+-      headers: {
+-        "Content-Type": "application/json",
+-      },
+-      body: JSON.stringify(body),
+-    })
+-
+-    if (!res.ok) {
+-      return NextResponse.json(
+-          { message: "Invalid credentials" },
+-          { status: 401 }
+-      )
+-    }
+-
+-    const authHeader = res.headers.get("authorization")
+-
+-    const token = authHeader?.replace("Bearer ", "")
+-
+-    if (!token) {
+-      return NextResponse.json({ error: "No token" }, { status: 500 })
+-    }
+-
+-    const response = NextResponse.json({ success: true })
+-
+-    response.cookies.set("jwt", token, {
+-      httpOnly: true,
+-      sameSite: "lax",
+-      secure: false,
+-      path: "/",
+-      maxAge: 60 * 60 * 24 * 7
+-    })
+-
+-    return response
+-  } catch (err) {
+-    return NextResponse.json(
+-        { message: "Server error" },
+-        { status: 500 }
+-    )
+-  }
+-}
+\ No newline at end of file
+diff --git a/app/api/logout/route.ts b/app/api/logout/route.ts
+deleted file mode 100644
+index c24b589..0000000
+--- a/app/api/logout/route.ts
++++ /dev/null
+@@ -1,12 +0,0 @@
+-import { NextResponse } from "next/server"
+-
+-export async function POST() {
+-  const res = NextResponse.json({ success: true })
+-
+-  res.cookies.set("jwt", "", {
+-    path: "/",
+-    maxAge: 0,
+-  })
+-
+-  return res
+-}
+\ No newline at end of file
+diff --git a/app/api/me/route.ts b/app/api/me/route.ts
+deleted file mode 100644
+index e9b8d3b..0000000
+--- a/app/api/me/route.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import { cookies } from "next/headers"
+-
+-export async function GET() {
+-  const token = (await cookies()).get("jwt")?.value
+-
+-  if (!token) {
+-    return Response.json({ error: "Unauthorized" }, { status: 401 })
+-  }
+-
+-  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/me`, {
+-    method: "GET",
+-    headers: {
+-      Authorization: `Bearer ${token}`,
+-    },
+-  })
+-
+-  if (!res.ok) {
+-    return Response.json({ error: "Failed to fetch user" }, { status: res.status })
+-  }
+-
+-  const data = await res.json()
+-
+-  return Response.json(data)
+-}
+\ No newline at end of file
+diff --git a/app/page.tsx b/app/page.tsx
+index 28e0813..c82ee2b 100644
+--- a/app/page.tsx
++++ b/app/page.tsx
+@@ -1,5 +1,14 @@
+-import { redirect } from "next/navigation"
++"use client"
++
++import { useEffect } from "react"
++import { useRouter } from "next/navigation"
+ 
+ export default function Home() {
+-  redirect("/dashboard")
+-}
+\ No newline at end of file
++  const router = useRouter()
++
++  useEffect(() => {
++    router.replace("/dashboard")
++  }, [router])
++
++  return null
++}
+diff --git a/components/ui/cardHorizontalDemo.tsx b/components/ui/cardHorizontalDemo.tsx
+index 18dcc5a..db61a40 100644
+--- a/components/ui/cardHorizontalDemo.tsx
++++ b/components/ui/cardHorizontalDemo.tsx
+@@ -12,7 +12,7 @@ const CardHorizontalDemo = () => {
+       <CardFooter className='justify-between gap-3 max-sm:flex-col max-sm:items-stretch'>
+         <div className='flex items-center gap-3'>
+           <Avatar className='ring-ring ring-2'>
+-            <AvatarImage src='https://cdn.shadcnstudio.com/ss-assets/avatar/avatar-5.png' alt='Hallie Richards' />
++            <AvatarImage src='/astronaut.webp' alt='Hallie Richards' />
+             <AvatarFallback className='text-xs'>SG</AvatarFallback>
+           </Avatar>
+           <div className='flex flex-col gap-0.5'>
+diff --git a/middleware.ts b/middleware.ts
+deleted file mode 100644
+index d203f5c..0000000
+--- a/middleware.ts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-import { NextResponse } from "next/server"
+-import type { NextRequest } from "next/server"
+-
+-export function middleware(req: NextRequest) {
+-  const token = req.cookies.get("jwt")?.value
+-  const isAuthPage = req.nextUrl.pathname === "/login"
+-
+-  if (!token && !isAuthPage) {
+-    return NextResponse.redirect(new URL("/login", req.url))
+-  }
+-
+-  if (token && isAuthPage) {
+-    return NextResponse.redirect(new URL("/dashboard", req.url))
+-  }
+-
+-  return NextResponse.next()
+-}
+-
+-export const config = {
+-  matcher: ["/dashboard/:path*", "/login"],
+-}
+\ No newline at end of file
+diff --git a/next.config.ts b/next.config.ts
+index e9ffa30..00c940e 100644
+--- a/next.config.ts
++++ b/next.config.ts
+@@ -1,7 +1,10 @@
+ import type { NextConfig } from "next";
+ 
+ const nextConfig: NextConfig = {
+-  /* config options here */
++  output: "export",
++  images: {
++    unoptimized: true,
++  },
+ };
+ 
+ export default nextConfig;

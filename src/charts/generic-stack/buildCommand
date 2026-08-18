@@ -1,0 +1,10 @@
+#!/bin/sh
+echo `# <#` >/dev/null
+# ---------------------------------- POSIX sh ----------------------------------
+set -eu
+helm lint .
+exec helm package . --destination dist
+#> >$null
+# --------------------------------- PowerShell ---------------------------------
+helm lint .
+if ($LASTEXITCODE -eq 0) { helm package . --destination dist }

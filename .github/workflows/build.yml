@@ -1,0 +1,229 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and republish everything, ignoring up-to-date checks
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Determine which artifacts are out of date (registry state vs git tree hash)
+  # ---------------------------------------------------------------------------
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.plan.outputs.images }}
+      any_images: ${{ steps.plan.outputs.any_images }}
+      chart_needed: ${{ steps.plan.outputs.chart_needed }}
+      chart_version: ${{ steps.plan.outputs.chart_version }}
+      chart_treetag: ${{ steps.plan.outputs.chart_treetag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login
+        run: skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          up_to_date() {
+            local dest=$1 tag=$2 treetag=$3 dt dv
+            dt=$(skopeo inspect --format '{{.Digest}}' "docker://$dest:$treetag" 2>/dev/null || true)
+            dv=$(skopeo inspect --format '{{.Digest}}' "docker://$dest:$tag" 2>/dev/null || true)
+            [ -n "$dt" ] && [ "$dt" = "$dv" ]
+          }
+          CHART_VALUES=src/charts/generic-stack/values.yaml
+          entries=()
+          mismatch=0
+          for dir in src/*/; do
+            comp=$(basename "$dir")
+            [ -f "$dir/Containerfile" ] || continue
+            ref=$(grep -oE 'localhost/[a-z0-9._-]+:[A-Za-z0-9._-]+' "$dir/buildCommand" | head -1)
+            name=${ref#localhost/}; tag=${name#*:}; name=${name%%:*}
+            lc=${comp,,}
+            ctag=$(yq -r ".components.[\"$lc\"].image.tag // \"\"" "$CHART_VALUES")
+            if [ -n "$ctag" ]; then
+              crepo=$(yq -r ".components.[\"$lc\"].image.repository // \"\"" "$CHART_VALUES")
+              if [ "$crepo" != "$name" ] || [ "$ctag" != "$tag" ]; then
+                echo "::error file=$CHART_VALUES::components.$lc pins $crepo:$ctag but src/$comp/buildCommand builds $name:$tag"
+                mismatch=1
+              fi
+            fi
+            tree=$(git rev-parse "HEAD:src/$comp")
+            treetag="tree-${tree:0:16}"
+            if [ "$FORCE" != "true" ] && up_to_date "$REGISTRY/$REPO_LC/$name" "$tag" "$treetag"; then
+              echo "up to date: $comp ($name:$tag @ $treetag)"
+              continue
+            fi
+            echo "needs build: $comp ($name:$tag @ $treetag)"
+            entries+=("{\"component\":\"$comp\",\"lc\":\"${comp,,}\",\"name\":\"$name\",\"tag\":\"$tag\",\"treetag\":\"$treetag\"}")
+          done
+          if [ "$mismatch" != "0" ]; then
+            echo "consistency gate failed: chart image pins and buildCommand tags disagree"
+            exit 1
+          fi
+          images=$(printf '%s\n' "${entries[@]:-}" | grep -v '^$' | jq -sc '.')
+
+          chart_version=$(grep -E '^version:' src/charts/generic-stack/Chart.yaml | awk '{print $2}')
+          chart_tree=$(git rev-parse "HEAD:src/charts/generic-stack")
+          chart_treetag="tree-${chart_tree:0:16}"
+          chart_needed=true
+          if [ "$FORCE" != "true" ] && up_to_date "$REGISTRY/$REPO_LC/charts/generic-stack" "$chart_version" "$chart_treetag"; then
+            chart_needed=false
+          fi
+          {
+            echo "images=$images"
+            echo "any_images=$([ "$images" != "[]" ] && echo true || echo false)"
+            echo "chart_needed=$chart_needed"
+            echo "chart_version=$chart_version"
+            echo "chart_treetag=$chart_treetag"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # One native build per image per architecture; scan gates before staging push
+  # ---------------------------------------------------------------------------
+  build:
+    needs: discover
+    if: needs.discover.outputs.any_images == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login
+        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+      - name: Build
+        working-directory: src/${{ matrix.image.component }}
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          VCS_REF=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LINE=$(grep -E 'podman build' buildCommand | grep -F "linux/${{ matrix.arch }}" | head -1)
+          EXTRA=()
+          while IFS= read -r pair; do
+            [ -n "$pair" ] && EXTRA+=(--build-arg "$pair")
+          done < <(printf '%s\n' "$LINE" | grep -oE -- '--build-arg [A-Za-z_]+=[^ ]+' | grep -vE 'VCS_REF|BUILD_DATE' | sed 's/^--build-arg //' || true)
+          CACHE="$REGISTRY/$REPO_LC/cache/${{ matrix.image.lc }}-${{ matrix.arch }}"
+          podman build --platform "linux/${{ matrix.arch }}" --layers \
+            --cache-from "$CACHE" --cache-to "$CACHE" \
+            --build-arg VCS_REF="$VCS_REF" --build-arg BUILD_DATE="$BUILD_DATE" \
+            "${EXTRA[@]}" \
+            -t "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}" \
+            -f Containerfile .
+      - name: Cache vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ matrix.arch }}-${{ github.run_number }}
+          restore-keys: trivy-db-${{ matrix.arch }}-
+      - name: Scan and SBOM
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.58.1
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.19.0
+          podman save -o /tmp/image.tar "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}"
+          trivy image --input /tmp/image.tar --severity CRITICAL --ignore-unfixed --exit-code 1
+          syft "docker-archive:/tmp/image.tar" -o spdx-json > "sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json"
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}
+          path: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json
+      - name: Push architecture image
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          podman push --compression-format zstd:chunked --compression-level 19 --format oci \
+            "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}" \
+            "docker://$REGISTRY/$REPO_LC/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}"
+
+  # ---------------------------------------------------------------------------
+  # Assemble and publish the multi-arch manifest lists (version + tree tags)
+  # ---------------------------------------------------------------------------
+  manifest:
+    needs: [discover, build]
+    if: needs.discover.outputs.any_images == 'true' && github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Login
+        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+      - name: Publish manifest list
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          DEST="$REGISTRY/$REPO_LC/${{ matrix.image.name }}"
+          podman manifest create list
+          podman manifest add list "docker://$DEST:${{ matrix.image.tag }}-amd64"
+          podman manifest add list "docker://$DEST:${{ matrix.image.tag }}-arm64"
+          podman manifest push list "docker://$DEST:${{ matrix.image.tag }}"
+          podman manifest push list "docker://$DEST:${{ matrix.image.treetag }}"
+
+  # ---------------------------------------------------------------------------
+  # Verify and publish the chart as an OCI artifact
+  # ---------------------------------------------------------------------------
+  chart:
+    needs: [discover, manifest]
+    if: needs.discover.outputs.chart_needed == 'true' && !failure() && !cancelled()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify and package
+        working-directory: src/charts/generic-stack
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          curl -sSfL -o /usr/local/bin/kubeconform.tgz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /usr/local/bin/kubeconform.tgz -C /usr/local/bin kubeconform
+          sed -i "s|^  imageRegistry: .*|  imageRegistry: $REGISTRY/$REPO_LC|" values.yaml
+          helm lint .
+          helm template ci . \
+            --set components.db.secret.db-password=x \
+            --set components.backend.secret.db-password=x \
+            --set components.backend.secret.jwt-secret=x \
+            | kubeconform -strict -summary
+          helm package . --destination dist
+      - name: Push chart
+        if: github.event_name != 'pull_request'
+        working-directory: src/charts/generic-stack
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          helm push "dist/generic-stack-${{ needs.discover.outputs.chart_version }}.tgz" "oci://$REGISTRY/$REPO_LC/charts"
+          skopeo copy \
+            "docker://$REGISTRY/$REPO_LC/charts/generic-stack:${{ needs.discover.outputs.chart_version }}" \
+            "docker://$REGISTRY/$REPO_LC/charts/generic-stack:${{ needs.discover.outputs.chart_treetag }}"

@@ -1,0 +1,23 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.persistence.enabled (eq $spec.kind "Deployment") }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "generic-stack.componentName" (dict "root" $ "name" $name) }}-data
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml $spec.persistence.accessModes | nindent 4 }}
+  {{- $sc := $spec.persistence.storageClass | default $.Values.global.storageClass }}
+  {{- if $sc }}
+  storageClassName: {{ $sc }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $spec.persistence.size }}
+{{- end }}
+{{- end }}

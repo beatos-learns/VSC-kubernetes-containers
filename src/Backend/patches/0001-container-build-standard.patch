@@ -1,0 +1,806 @@
+diff --git a/build.gradle b/build.gradle
+index c561d45..1bc9e96 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -1,6 +1,7 @@
+ plugins {
+     id 'org.springframework.boot' version '4.1.0-M3'
+     id 'io.spring.dependency-management' version '1.1.7'
++    id 'org.graalvm.buildtools.native' version '1.1.9'
+     id 'java'
+ }
+ 
+@@ -39,3 +40,22 @@ dependencies {
+ tasks.named('test') {
+     useJUnitPlatform()
+ }
++
++graalvmNative {
++    metadataRepository {
++        enabled = true
++    }
++    binaries {
++        main {
++            imageName = 'user-mgmt-service'
++            mainClass = 'com.example.jwt.JwtApplication'
++            buildArgs.add('--no-fallback')
++            buildArgs.add('-Os')
++            buildArgs.add('-march=compatibility')
++            def linkArgs = System.getenv('NATIVE_LINK_ARGS')
++            if (linkArgs != null && !linkArgs.isBlank()) {
++                linkArgs.trim().split('\\s+').each { arg -> buildArgs.add(arg) }
++            }
++        }
++    }
++}
+diff --git a/src/main/java/com/example/jwt/JwtApplication.java b/src/main/java/com/example/jwt/JwtApplication.java
+index 187dc05..9041d7c 100644
+--- a/src/main/java/com/example/jwt/JwtApplication.java
++++ b/src/main/java/com/example/jwt/JwtApplication.java
+@@ -1,13 +1,44 @@
+ package com.example.jwt;
+ 
++import com.example.jwt.ops.Ops;
++import com.example.jwt.ops.OpsConfig;
++import com.example.jwt.ops.ProbeCommand;
++import com.example.jwt.ops.SignalShutdown;
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.context.ConfigurableApplicationContext;
+ 
+ @SpringBootApplication
+ public class JwtApplication {
+ 
+   public static void main(String[] args) {
+-    SpringApplication.run(JwtApplication.class, args);
++    if (args.length > 0 && "healthcheck".equals(args[0])) {
++      System.exit(ProbeCommand.run(args));
++    }
++    if (Boolean.getBoolean("spring.aot.processing")) {
++      SpringApplication.run(JwtApplication.class, args);
++      return;
++    }
++    OpsConfig config;
++    try {
++      config = OpsConfig.fromEnvironment();
++    } catch (IllegalStateException e) {
++      System.err.println("fatal configuration error: " + e.getMessage());
++      System.exit(1);
++      return;
++    }
++    if ("json".equals(config.logFormat())) {
++      System.setProperty("logging.structured.format.console", "ecs");
++    }
++    System.setProperty("logging.level.root", config.logLevel());
++    try {
++      Ops.bootstrap(config);
++      ConfigurableApplicationContext context = SpringApplication.run(JwtApplication.class, args);
++      SignalShutdown.install(config, Ops.state(), context);
++    } catch (Throwable t) {
++      t.printStackTrace();
++      System.exit(1);
++    }
+   }
+ 
+ }
+diff --git a/src/main/java/com/example/jwt/ops/AdminServer.java b/src/main/java/com/example/jwt/ops/AdminServer.java
+new file mode 100644
+index 0000000..c91b6f7
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/AdminServer.java
+@@ -0,0 +1,105 @@
++package com.example.jwt.ops;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.Map;
++import java.util.concurrent.Executors;
++import java.util.function.BooleanSupplier;
++
++/**
++ * Probe and metrics listener on ADMIN_PORT. Handlers are O(1) reads of the
++ * cached snapshot; probe hits are deliberately not logged.
++ */
++public final class AdminServer {
++
++  private final OpsConfig config;
++  private final HealthState state;
++  private HttpServer server;
++
++  public AdminServer(OpsConfig config, HealthState state) {
++    this.config = config;
++    this.state = state;
++  }
++
++  public void start() throws IOException {
++    server = HttpServer.create(new InetSocketAddress(config.bindAddr(), config.adminPort()), 0);
++    server.setExecutor(Executors.newFixedThreadPool(2, runnable -> {
++      Thread thread = new Thread(runnable, "admin-http");
++      thread.setDaemon(true);
++      return thread;
++    }));
++    server.createContext("/startupz", exchange -> probe(exchange, state::started));
++    server.createContext("/livez",
++        exchange -> probe(exchange, () -> state.live(config, System.currentTimeMillis())));
++    server.createContext("/readyz",
++        exchange -> probe(exchange, () -> state.ready(config, System.currentTimeMillis())));
++    server.createContext("/metrics", this::metrics);
++    server.start();
++  }
++
++  private void probe(HttpExchange exchange, BooleanSupplier up) throws IOException {
++    boolean ok = up.getAsBoolean();
++    String body = (exchange.getRequestURI().getQuery() != null
++        && exchange.getRequestURI().getQuery().contains("verbose=1"))
++            ? verboseBody(ok)
++            : (ok ? "ok" : "unavailable");
++    respond(exchange, ok ? 200 : 503, body,
++        body.startsWith("{") ? "application/json" : "text/plain; charset=utf-8");
++  }
++
++  private String verboseBody(boolean ok) {
++    HealthSnapshot snapshot = state.snapshot();
++    StringBuilder json = new StringBuilder("{\"status\":\"").append(ok ? "ok" : "unavailable")
++        .append("\",\"draining\":").append(state.draining())
++        .append(",\"snapshotAgeMillis\":")
++        .append(snapshot.takenAtMillis() == 0 ? -1 : System.currentTimeMillis() - snapshot.takenAtMillis())
++        .append(",\"checks\":{");
++    boolean first = true;
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : snapshot.results().entrySet()) {
++      if (!first) {
++        json.append(',');
++      }
++      first = false;
++      json.append('"').append(entry.getKey()).append("\":{\"ok\":").append(entry.getValue().ok())
++          .append(",\"detail\":\"").append(entry.getValue().detail().replace("\"", "'"))
++          .append("\"}");
++    }
++    return json.append("}}").toString();
++  }
++
++  private void metrics(HttpExchange exchange) throws IOException {
++    String version = envOr("APP_VERSION", "dev");
++    String revision = envOr("APP_REVISION", "unknown");
++    StringBuilder body = new StringBuilder();
++    body.append("# TYPE build_info gauge\n");
++    body.append("build_info{version=\"").append(version).append("\",revision=\"").append(revision)
++        .append("\"} 1\n");
++    body.append("# TYPE health_check_up gauge\n");
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : state.snapshot().results().entrySet()) {
++      body.append("health_check_up{check=\"").append(entry.getKey()).append("\"} ")
++          .append(entry.getValue().ok() ? 1 : 0).append('\n');
++    }
++    body.append("# EOF\n");
++    respond(exchange, 200, body.toString(),
++        "application/openmetrics-text; version=1.0.0; charset=utf-8");
++  }
++
++  private static void respond(HttpExchange exchange, int status, String body, String contentType)
++      throws IOException {
++    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
++    exchange.getResponseHeaders().set("Content-Type", contentType);
++    exchange.sendResponseHeaders(status, bytes.length);
++    try (OutputStream out = exchange.getResponseBody()) {
++      out.write(bytes);
++    }
++  }
++
++  private static String envOr(String name, String fallback) {
++    String value = System.getenv(name);
++    return (value == null || value.isBlank()) ? fallback : value;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/HealthCheck.java b/src/main/java/com/example/jwt/ops/HealthCheck.java
+new file mode 100644
+index 0000000..99d001d
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/HealthCheck.java
+@@ -0,0 +1,10 @@
++package com.example.jwt.ops;
++
++/** One registered readiness check; executed concurrently each cycle, bounded by HEALTH_CHECK_TIMEOUT. */
++public interface HealthCheck {
++
++  String name();
++
++  /** Returns on success; throws on failure. */
++  void run() throws Exception;
++}
+diff --git a/src/main/java/com/example/jwt/ops/HealthChecker.java b/src/main/java/com/example/jwt/ops/HealthChecker.java
+new file mode 100644
+index 0000000..f8acbfc
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/HealthChecker.java
+@@ -0,0 +1,122 @@
++package com.example.jwt.ops;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The single background loop owning all real checks. Endpoints only read the
++ * atomic snapshot this loop swaps in once per HEALTH_CHECK_INTERVAL.
++ */
++public final class HealthChecker implements Runnable {
++
++  private static final Logger log = LoggerFactory.getLogger(HealthChecker.class);
++
++  private final OpsConfig config;
++  private final HealthState state;
++  private final List<HealthCheck> checks = new CopyOnWriteArrayList<>();
++  private final ExecutorService executor;
++
++  public HealthChecker(OpsConfig config, HealthState state) {
++    this.config = config;
++    this.state = state;
++    ThreadFactory daemonFactory = runnable -> {
++      Thread thread = new Thread(runnable, "health-check-worker");
++      thread.setDaemon(true);
++      return thread;
++    };
++    this.executor = Executors.newCachedThreadPool(daemonFactory);
++  }
++
++  public void register(HealthCheck check) {
++    checks.add(check);
++  }
++
++  public void start() {
++    Thread loop = new Thread(this, "health-checker");
++    loop.setDaemon(true);
++    loop.start();
++  }
++
++  @Override
++  public void run() {
++    while (!Thread.currentThread().isInterrupted()) {
++      try {
++        long cycleStart = System.currentTimeMillis();
++        runCycle();
++        long remaining = config.healthCheckInterval() * 1000L
++            - (System.currentTimeMillis() - cycleStart);
++        if (remaining > 0) {
++          TimeUnit.MILLISECONDS.sleep(remaining);
++        }
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++        return;
++      } catch (Exception e) {
++        log.error("health check cycle failed unexpectedly", e);
++      }
++    }
++  }
++
++  private void runCycle() {
++    Map<String, HealthSnapshot.CheckResult> previous = state.snapshot().results();
++    Map<String, HealthSnapshot.CheckResult> results = new LinkedHashMap<>();
++    results.put("spring-context", state.contextReady()
++        ? new HealthSnapshot.CheckResult(true, "application context ready")
++        : new HealthSnapshot.CheckResult(false, "application context not ready yet"));
++
++    List<HealthCheck> current = List.copyOf(checks);
++    Map<String, Future<?>> futures = new LinkedHashMap<>();
++    for (HealthCheck check : current) {
++      futures.put(check.name(), executor.submit(() -> {
++        check.run();
++        return null;
++      }));
++    }
++    for (Map.Entry<String, Future<?>> entry : futures.entrySet()) {
++      HealthSnapshot.CheckResult result;
++      try {
++        entry.getValue().get(config.healthCheckTimeout(), TimeUnit.SECONDS);
++        result = new HealthSnapshot.CheckResult(true, "ok");
++      } catch (TimeoutException e) {
++        entry.getValue().cancel(true);
++        result = new HealthSnapshot.CheckResult(false,
++            "timed out after " + config.healthCheckTimeout() + "s");
++      } catch (Exception e) {
++        Throwable cause = e.getCause() != null ? e.getCause() : e;
++        result = new HealthSnapshot.CheckResult(false, String.valueOf(cause.getMessage()));
++      }
++      results.put(entry.getKey(), result);
++    }
++
++    HealthSnapshot next = new HealthSnapshot(Map.copyOf(results), System.currentTimeMillis());
++    state.swapSnapshot(next);
++
++    if (!state.started() && next.allOk()) {
++      state.latchStarted();
++      log.info("startup complete: first fully successful health cycle");
++    }
++    logTransitions(previous, results);
++  }
++
++  private void logTransitions(Map<String, HealthSnapshot.CheckResult> previous,
++      Map<String, HealthSnapshot.CheckResult> current) {
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : current.entrySet()) {
++      HealthSnapshot.CheckResult before = previous.get(entry.getKey());
++      if (before != null && before.ok() != entry.getValue().ok()) {
++        log.info("health check '{}' transitioned {} -> {} ({})", entry.getKey(),
++            before.ok() ? "ok" : "failing", entry.getValue().ok() ? "ok" : "failing",
++            entry.getValue().detail());
++      }
++    }
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/HealthSnapshot.java b/src/main/java/com/example/jwt/ops/HealthSnapshot.java
+new file mode 100644
+index 0000000..1e0f402
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/HealthSnapshot.java
+@@ -0,0 +1,13 @@
++package com.example.jwt.ops;
++
++import java.util.Map;
++
++/** Immutable result of one full check cycle; swapped behind a single atomic reference. */
++public record HealthSnapshot(Map<String, CheckResult> results, long takenAtMillis) {
++
++  public record CheckResult(boolean ok, String detail) {}
++
++  public boolean allOk() {
++    return results.values().stream().allMatch(CheckResult::ok);
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/HealthState.java b/src/main/java/com/example/jwt/ops/HealthState.java
+new file mode 100644
+index 0000000..a2851c9
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/HealthState.java
+@@ -0,0 +1,59 @@
++package com.example.jwt.ops;
++
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicReference;
++
++/** Shared, lock-free health state read by the admin endpoints. */
++public final class HealthState {
++
++  private final AtomicReference<HealthSnapshot> snapshot =
++      new AtomicReference<>(new HealthSnapshot(Map.of(), 0L));
++  private volatile boolean started;
++  private volatile boolean draining;
++  private volatile boolean contextReady;
++
++  public HealthSnapshot snapshot() {
++    return snapshot.get();
++  }
++
++  public void swapSnapshot(HealthSnapshot next) {
++    snapshot.set(next);
++  }
++
++  public boolean started() {
++    return started;
++  }
++
++  public void latchStarted() {
++    started = true;
++  }
++
++  public boolean draining() {
++    return draining;
++  }
++
++  public void latchDraining() {
++    draining = true;
++  }
++
++  public boolean contextReady() {
++    return contextReady;
++  }
++
++  public void markContextReady() {
++    contextReady = true;
++  }
++
++  public boolean fresh(OpsConfig config, long nowMillis) {
++    long ageMillis = nowMillis - snapshot.get().takenAtMillis();
++    return ageMillis <= (long) (config.healthStaleFactor() * config.healthCheckInterval() * 1000.0);
++  }
++
++  public boolean live(OpsConfig config, long nowMillis) {
++    return fresh(config, nowMillis);
++  }
++
++  public boolean ready(OpsConfig config, long nowMillis) {
++    return fresh(config, nowMillis) && snapshot.get().allOk() && !draining;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/Ops.java b/src/main/java/com/example/jwt/ops/Ops.java
+new file mode 100644
+index 0000000..7bfbbb7
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/Ops.java
+@@ -0,0 +1,39 @@
++package com.example.jwt.ops;
++
++import java.io.IOException;
++
++/**
++ * Process-wide holder wiring the ops machinery started in main() (before the
++ * Spring context exists) to the Spring-managed pieces registered once the
++ * context is ready.
++ */
++public final class Ops {
++
++  private static volatile OpsConfig config;
++  private static volatile HealthState state;
++  private static volatile HealthChecker checker;
++  private static volatile AdminServer admin;
++
++  private Ops() {}
++
++  public static void bootstrap(OpsConfig cfg) throws IOException {
++    config = cfg;
++    state = new HealthState();
++    checker = new HealthChecker(cfg, state);
++    admin = new AdminServer(cfg, state);
++    admin.start();
++    checker.start();
++  }
++
++  public static OpsConfig config() {
++    return config;
++  }
++
++  public static HealthState state() {
++    return state;
++  }
++
++  public static void registerCheck(HealthCheck check) {
++    checker.register(check);
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/OpsBootstrap.java b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
+new file mode 100644
+index 0000000..f0e57d6
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
+@@ -0,0 +1,57 @@
++package com.example.jwt.ops;
++
++import com.example.jwt.core.security.helpers.Credentials;
++import java.sql.Connection;
++import java.sql.Statement;
++import javax.sql.DataSource;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.aot.hint.annotation.RegisterReflectionForBinding;
++import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.context.annotation.ImportRuntimeHints;
++import org.springframework.context.event.EventListener;
++
++/**
++ * Registers the service-function-derived checks once the context is up. The
++ * reflection hint covers the hand-instantiated ObjectMapper deserialization of
++ * Credentials in CustomAuthenticationFilter, which Spring AOT cannot discover.
++ */
++@Configuration(proxyBeanMethods = false)
++@ImportRuntimeHints(OpsRuntimeHints.class)
++@RegisterReflectionForBinding(Credentials.class)
++public class OpsBootstrap {
++
++  private static final Logger log = LoggerFactory.getLogger(OpsBootstrap.class);
++
++  private final DataSource dataSource;
++
++  public OpsBootstrap(DataSource dataSource) {
++    this.dataSource = dataSource;
++  }
++
++  @EventListener(ApplicationReadyEvent.class)
++  public void onApplicationReady() {
++    OpsConfig config = Ops.config();
++    Ops.registerCheck(new HealthCheck() {
++      @Override
++      public String name() {
++        return "database";
++      }
++
++      @Override
++      public void run() throws Exception {
++        try (Connection connection = dataSource.getConnection();
++            Statement statement = connection.createStatement()) {
++          statement.setQueryTimeout(config.healthCheckTimeout());
++          statement.execute("SELECT 1");
++        }
++      }
++    });
++    Ops.state().markContextReady();
++    log.info("user-mgmt-service started: version={} revision={} config[{}]",
++        System.getenv().getOrDefault("APP_VERSION", "dev"),
++        System.getenv().getOrDefault("APP_REVISION", "unknown"),
++        config.redactedSummary());
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/OpsConfig.java b/src/main/java/com/example/jwt/ops/OpsConfig.java
+new file mode 100644
+index 0000000..f1d17e1
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/OpsConfig.java
+@@ -0,0 +1,96 @@
++package com.example.jwt.ops;
++
++import java.util.List;
++
++/**
++ * Runtime configuration surface of the container image contract. Parsed and
++ * validated once at process start; any violation aborts startup immediately.
++ */
++public record OpsConfig(
++    int port,
++    int adminPort,
++    String bindAddr,
++    String logLevel,
++    String logFormat,
++    int healthCheckInterval,
++    int healthCheckTimeout,
++    double healthStaleFactor,
++    int shutdownDrainDelay,
++    int shutdownTimeout) {
++
++  public static OpsConfig fromEnvironment() {
++    int port = intEnv("PORT", 8080, 1, 65535);
++    int adminPort = intEnv("ADMIN_PORT", 9090, 1, 65535);
++    String bindAddr = env("BIND_ADDR", "0.0.0.0");
++    String logLevel = enumEnv("LOG_LEVEL", "info", List.of("trace", "debug", "info", "warn", "error"));
++    String logFormat = enumEnv("LOG_FORMAT", "json", List.of("json", "text"));
++    int interval = intEnv("HEALTH_CHECK_INTERVAL", 5, 1, 3600);
++    int timeout = intEnv("HEALTH_CHECK_TIMEOUT", 2, 1, 3600);
++    double staleFactor = doubleEnv("HEALTH_STALE_FACTOR", 3.0, 1.0, 100.0);
++    int drainDelay = intEnv("SHUTDOWN_DRAIN_DELAY", 3, 0, 600);
++    int shutdownTimeout = intEnv("SHUTDOWN_TIMEOUT", 10, 1, 3600);
++    if (timeout >= interval) {
++      throw new IllegalStateException(
++          "HEALTH_CHECK_TIMEOUT (" + timeout + "s) must be smaller than HEALTH_CHECK_INTERVAL (" + interval + "s)");
++    }
++    if (port == adminPort) {
++      throw new IllegalStateException("PORT and ADMIN_PORT must differ (both " + port + ")");
++    }
++    return new OpsConfig(port, adminPort, bindAddr, logLevel, logFormat,
++        interval, timeout, staleFactor, drainDelay, shutdownTimeout);
++  }
++
++  public String redactedSummary() {
++    return "PORT=" + port
++        + " ADMIN_PORT=" + adminPort
++        + " BIND_ADDR=" + bindAddr
++        + " LOG_LEVEL=" + logLevel
++        + " LOG_FORMAT=" + logFormat
++        + " HEALTH_CHECK_INTERVAL=" + healthCheckInterval
++        + " HEALTH_CHECK_TIMEOUT=" + healthCheckTimeout
++        + " HEALTH_STALE_FACTOR=" + healthStaleFactor
++        + " SHUTDOWN_DRAIN_DELAY=" + shutdownDrainDelay
++        + " SHUTDOWN_TIMEOUT=" + shutdownTimeout;
++  }
++
++  private static String env(String name, String fallback) {
++    String value = System.getenv(name);
++    return (value == null || value.isBlank()) ? fallback : value.trim();
++  }
++
++  private static String enumEnv(String name, String fallback, List<String> allowed) {
++    String value = env(name, fallback).toLowerCase();
++    if (!allowed.contains(value)) {
++      throw new IllegalStateException(name + "=" + value + " is invalid; allowed: " + allowed);
++    }
++    return value;
++  }
++
++  private static int intEnv(String name, int fallback, int min, int max) {
++    String raw = env(name, Integer.toString(fallback));
++    int value;
++    try {
++      value = Integer.parseInt(raw);
++    } catch (NumberFormatException e) {
++      throw new IllegalStateException(name + "=" + raw + " is not an integer");
++    }
++    if (value < min || value > max) {
++      throw new IllegalStateException(name + "=" + value + " is outside [" + min + ", " + max + "]");
++    }
++    return value;
++  }
++
++  private static double doubleEnv(String name, double fallback, double min, double max) {
++    String raw = env(name, Double.toString(fallback));
++    double value;
++    try {
++      value = Double.parseDouble(raw);
++    } catch (NumberFormatException e) {
++      throw new IllegalStateException(name + "=" + raw + " is not a number");
++    }
++    if (value < min || value > max) {
++      throw new IllegalStateException(name + "=" + value + " is outside [" + min + ", " + max + "]");
++    }
++    return value;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java b/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java
+new file mode 100644
+index 0000000..bc0860b
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java
+@@ -0,0 +1,15 @@
++package com.example.jwt.ops;
++
++import org.springframework.aot.hint.RuntimeHints;
++import org.springframework.aot.hint.RuntimeHintsRegistrar;
++
++/** Resource bundles resolved reflectively at runtime need explicit native-image hints. */
++public class OpsRuntimeHints implements RuntimeHintsRegistrar {
++
++  @Override
++  public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
++    hints.resources().registerResourceBundle("messages");
++    hints.resources().registerResourceBundle("validationMessages");
++    hints.reflection().registerType(java.util.UUID[].class);
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/ProbeCommand.java b/src/main/java/com/example/jwt/ops/ProbeCommand.java
+new file mode 100644
+index 0000000..18f70ca
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/ProbeCommand.java
+@@ -0,0 +1,57 @@
++package com.example.jwt.ops;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.Set;
++
++/**
++ * Exec-style probe: `user-mgmt-service healthcheck --endpoint=livez` performs a
++ * local HTTP GET against ADMIN_PORT and exits 0/1, keeping the shell-less image
++ * probeable without curl or wget.
++ */
++public final class ProbeCommand {
++
++  private static final Set<String> ENDPOINTS = Set.of("startupz", "livez", "readyz");
++
++  private ProbeCommand() {}
++
++  public static int run(String[] args) {
++    String endpoint = "livez";
++    for (String arg : args) {
++      if (arg.startsWith("--endpoint=")) {
++        endpoint = arg.substring("--endpoint=".length());
++      }
++    }
++    if (!ENDPOINTS.contains(endpoint)) {
++      System.err.println("unknown endpoint '" + endpoint + "'; allowed: " + ENDPOINTS);
++      return 1;
++    }
++    String adminPort = System.getenv().getOrDefault("ADMIN_PORT", "9090");
++    String host = probeHost(System.getenv().getOrDefault("BIND_ADDR", "0.0.0.0"));
++    try (HttpClient client = HttpClient.newBuilder()
++        .connectTimeout(Duration.ofSeconds(2)).build()) {
++      HttpRequest request = HttpRequest.newBuilder()
++          .uri(URI.create("http://" + host + ":" + adminPort + "/" + endpoint))
++          .timeout(Duration.ofSeconds(3)).GET().build();
++      HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
++      return response.statusCode() == 200 ? 0 : 1;
++    } catch (Exception e) {
++      System.err.println("probe failed: " + e.getMessage());
++      return 1;
++    }
++  }
++
++  private static String probeHost(String bindAddr) {
++    String addr = bindAddr.isBlank() ? "0.0.0.0" : bindAddr.trim();
++    if (addr.equals("0.0.0.0") || addr.equals("*")) {
++      return "127.0.0.1";
++    }
++    if (addr.equals("::")) {
++      return "[::1]";
++    }
++    return addr.contains(":") ? "[" + addr + "]" : addr;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/SignalShutdown.java b/src/main/java/com/example/jwt/ops/SignalShutdown.java
+new file mode 100644
+index 0000000..545b115
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/SignalShutdown.java
+@@ -0,0 +1,66 @@
++package com.example.jwt.ops;
++
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.context.ConfigurableApplicationContext;
++import sun.misc.Signal;
++
++/**
++ * SIGTERM and SIGINT are handled identically: latch draining, keep serving for
++ * SHUTDOWN_DRAIN_DELAY, then close the context (graceful shutdown bounded by
++ * SHUTDOWN_TIMEOUT via spring.lifecycle.timeout-per-shutdown-phase), exit 0,
++ * or exit 1 when the drain budget was exhausted.
++ */
++public final class SignalShutdown {
++
++  private static final Logger log = LoggerFactory.getLogger(SignalShutdown.class);
++  private static final AtomicBoolean initiated = new AtomicBoolean(false);
++
++  private SignalShutdown() {}
++
++  public static void install(OpsConfig config, HealthState state,
++      ConfigurableApplicationContext context) {
++    Signal.handle(new Signal("TERM"), signal -> initiate(config, state, context));
++    Signal.handle(new Signal("INT"), signal -> initiate(config, state, context));
++  }
++
++  private static void initiate(OpsConfig config, HealthState state,
++      ConfigurableApplicationContext context) {
++    if (!initiated.compareAndSet(false, true)) {
++      return;
++    }
++    Thread drainThread = new Thread(() -> drain(config, state, context), "shutdown-drain");
++    drainThread.start();
++  }
++
++  private static void drain(OpsConfig config, HealthState state,
++      ConfigurableApplicationContext context) {
++    log.info("shutdown signal received: draining (readiness now 503, drain delay {}s)",
++        config.shutdownDrainDelay());
++    state.latchDraining();
++    try {
++      TimeUnit.SECONDS.sleep(config.shutdownDrainDelay());
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++    }
++    long begin = System.currentTimeMillis();
++    int exitCode = 0;
++    try {
++      context.close();
++    } catch (Exception e) {
++      log.error("error while closing application context", e);
++      exitCode = 1;
++    }
++    long elapsedMillis = System.currentTimeMillis() - begin;
++    if (elapsedMillis >= config.shutdownTimeout() * 1000L) {
++      log.warn("drain budget of {}s exhausted after {}ms; in-flight work may have been abandoned",
++          config.shutdownTimeout(), elapsedMillis);
++      exitCode = 1;
++    } else {
++      log.info("graceful shutdown complete in {}ms", elapsedMillis);
++    }
++    System.exit(exitCode);
++  }
++}
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index b15ef16..c379093 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -9,4 +9,9 @@ spring.jpa.properties.hibernate.format_sql=true
+ 
+ jwt.issuer=${JWT_ISSUER}
+ jwt.secret=${JWT_SECRET}
+-jwt.expiration-millis=${JWT_EXPIRATION_MILLIS}
+\ No newline at end of file
++jwt.expiration-millis=${JWT_EXPIRATION_MILLIS}
++server.port=${PORT:8080}
++server.address=${BIND_ADDR:0.0.0.0}
++server.shutdown=graceful
++spring.lifecycle.timeout-per-shutdown-phase=${SHUTDOWN_TIMEOUT:10}s
++spring.main.banner-mode=off

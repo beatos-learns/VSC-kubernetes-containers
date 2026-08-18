@@ -1,0 +1,58 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.service.enabled }}
+{{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+  {{- with $spec.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $spec.service.type }}
+  selector:
+    {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 4 }}
+  ports:
+    - name: {{ $spec.ports.main.name }}
+      port: {{ $spec.ports.main.servicePort | default $spec.ports.main.containerPort }}
+      targetPort: {{ $spec.ports.main.name }}
+      protocol: {{ $spec.ports.main.protocol | default "TCP" }}
+    {{- if $spec.service.exposeAdmin }}
+    - name: {{ $spec.ports.admin.name }}
+      port: {{ $spec.ports.admin.containerPort }}
+      targetPort: {{ $spec.ports.admin.name }}
+      protocol: TCP
+    {{- end }}
+    {{- range $spec.ports.extra }}
+    - name: {{ .name }}
+      port: {{ .servicePort | default .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+{{- if eq $spec.kind "StatefulSet" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-hl
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 4 }}
+  ports:
+    - name: {{ $spec.ports.main.name }}
+      port: {{ $spec.ports.main.servicePort | default $spec.ports.main.containerPort }}
+      targetPort: {{ $spec.ports.main.name }}
+      protocol: {{ $spec.ports.main.protocol | default "TCP" }}
+{{- end }}
+{{- end }}
+{{- end }}

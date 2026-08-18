@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+ARG APP_UID=10022
+ARG APP_GID=10022
+ARG VERSION=0.1.0
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+ARG SOURCE_COMMIT=599f7f8b0abcac739456d7bd95215c95b26706b6
+
+# ---------------------------------------------------------------------------
+FROM docker.io/library/node:24-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03 AS build
+ARG SOURCE_COMMIT
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git init -q . \
+ && git remote add origin https://github.com/yagan93/auth_portal.git \
+ && git fetch -q --depth 1 origin ${SOURCE_COMMIT} \
+ && git checkout -q FETCH_HEAD
+COPY patches/ /patches/
+RUN git apply /patches/*.patch
+RUN npm install -g pnpm@10.34.5
+RUN --mount=type=cache,target=/pnpm-store pnpm install --frozen-lockfile --store-dir /pnpm-store
+RUN pnpm build
+RUN install -d -m 1777 /src/.next/standalone/.next/cache
+
+# ---------------------------------------------------------------------------
+FROM docker.io/library/node:24-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+ARG APP_UID
+ARG APP_GID
+ARG VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="auth-portal" \
+      org.opencontainers.image.source="https://github.com/yagan93/auth_portal" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+WORKDIR /app
+COPY --from=build --chown=${APP_UID}:${APP_GID} /src/.next/standalone/ /app/
+COPY --from=build --chown=${APP_UID}:${APP_GID} /src/.next/static/ /app/.next/static/
+COPY --from=build --chown=${APP_UID}:${APP_GID} /src/public/ /app/public/
+COPY --chown=${APP_UID}:${APP_GID} ops/ /app/ops/
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    APP_VERSION=${VERSION} \
+    APP_REVISION=${VCS_REF}
+USER ${APP_UID}:${APP_GID}
+EXPOSE 3000 9090
+ENTRYPOINT ["node", "/app/ops/bootstrap.cjs"]

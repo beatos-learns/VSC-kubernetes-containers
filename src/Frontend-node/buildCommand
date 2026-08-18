@@ -1,0 +1,15 @@
+#!/bin/sh
+echo `# <#` >/dev/null
+# ---------------------------------- POSIX sh ----------------------------------
+set -eu
+VCS_REF=$(git rev-parse --short HEAD 2>/dev/null || echo adhoc)
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+podman manifest rm localhost/auth-portal:0.0.1-node >/dev/null 2>&1 || true
+exec podman build --platform linux/amd64,linux/arm64 --manifest localhost/auth-portal:0.0.1-node --build-arg VCS_REF="$VCS_REF" --build-arg BUILD_DATE="$BUILD_DATE" -f Containerfile .
+#> >$null
+# --------------------------------- PowerShell ---------------------------------
+$VCS_REF = 'adhoc'
+try { $r = git rev-parse --short HEAD 2>$null; if ($LASTEXITCODE -eq 0 -and $r) { $VCS_REF = "$r".Trim() } } catch { }
+$BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+try { podman manifest rm localhost/auth-portal:0.0.1-node 2>$null | Out-Null } catch { }
+podman build --platform 'linux/amd64,linux/arm64' --manifest localhost/auth-portal:0.0.1-node --build-arg VCS_REF=$VCS_REF --build-arg BUILD_DATE=$BUILD_DATE -f Containerfile .

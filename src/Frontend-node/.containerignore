@@ -1,0 +1,8 @@
+.git
+.gitignore
+*.md
+buildCommand
+.env*
+build/
+node_modules/
+.next/

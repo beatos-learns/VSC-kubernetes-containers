@@ -1,0 +1,12 @@
+.git/
+.gitignore
+dist/
+buildCommand
+NUL
+*.tgz
+*.swp
+*.bak
+*~
+.DS_Store
+.idea/
+.vscode/
