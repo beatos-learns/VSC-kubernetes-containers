@@ -26,6 +26,8 @@ defaults:
 
 env:
   REGISTRY: ghcr.io
+  TRIVY_VERSION: 0.74.0
+  SYFT_VERSION: 1.19.0
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ jobs:
       chart_version: ${{ steps.plan.outputs.chart_version }}
       chart_treetag: ${{ steps.plan.outputs.chart_treetag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Login
         run: skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
       - name: Plan
@@ -76,6 +78,10 @@ jobs:
             treetag="tree-${tree:0:16}"
             if [ "$FORCE" != "true" ] && up_to_date "$REGISTRY/$REPO_LC/$name" "$tag" "$treetag"; then
               echo "up to date: $comp ($name:$tag @ $treetag)"
+              if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && ! up_to_date "$REGISTRY/$REPO_LC/$name" "$tag" "latest"; then
+                echo "repointing latest: $comp ($name:$tag)"
+                skopeo copy --all "docker://$REGISTRY/$REPO_LC/$name:$tag" "docker://$REGISTRY/$REPO_LC/$name:latest"
+              fi
               continue
             fi
             echo "needs build: $comp ($name:$tag @ $treetag)"
@@ -85,7 +91,7 @@ jobs:
             echo "consistency gate failed: chart image pins and buildCommand tags disagree"
             exit 1
           fi
-          images=$(printf '%s\n' "${entries[@]:-}" | grep -v '^$' | jq -sc '.')
+          images=$(printf '%s\n' "${entries[@]:-}" | jq -sc '.')
 
           chart_version=$(grep -E '^version:' src/charts/generic-stack/Chart.yaml | awk '{print $2}')
           chart_tree=$(git rev-parse "HEAD:src/charts/generic-stack")
@@ -103,10 +109,90 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
+  # Seed the scan-tool and vulnerability-DB caches once per run: at most one
+  # download per tool per architecture, ever; build jobs only restore
+  # ---------------------------------------------------------------------------
+  tools:
+    needs: discover
+    if: needs.discover.outputs.any_images == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Restore amd64 tools
+        id: amd64
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/scan-tools-amd64
+          key: scan-tools-amd64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
+      - name: Probe arm64 tools
+        id: arm64
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/scan-tools-arm64
+          key: scan-tools-arm64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
+          lookup-only: true
+      - name: Download amd64 tools
+        if: steps.amd64.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/scan-tools-amd64
+          curl -sSfL --retry 3 --retry-delay 5 \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar -xz -C ~/scan-tools-amd64 trivy
+          curl -sSfL --retry 3 --retry-delay 5 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C ~/scan-tools-amd64 syft
+      - name: Save amd64 tools
+        if: steps.amd64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/scan-tools-amd64
+          key: scan-tools-amd64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
+      - name: Download arm64 tools
+        if: steps.arm64.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/scan-tools-arm64
+          curl -sSfL --retry 3 --retry-delay 5 \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" \
+            | tar -xz -C ~/scan-tools-arm64 trivy
+          curl -sSfL --retry 3 --retry-delay 5 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_arm64.tar.gz" \
+            | tar -xz -C ~/scan-tools-arm64 syft
+      - name: Save arm64 tools
+        if: steps.arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/scan-tools-arm64
+          key: scan-tools-arm64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
+      - name: Restore vulnerability DB
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+      - name: Update vulnerability DB
+        id: db
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          before=$( (cat ~/.cache/trivy/db/metadata.json 2>/dev/null || true) | sha256sum | cut -d' ' -f1)
+          ~/scan-tools-amd64/trivy image --download-db-only
+          after=$(sha256sum ~/.cache/trivy/db/metadata.json | cut -d' ' -f1)
+          echo "changed=$([ "$before" != "$after" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Save vulnerability DB
+        if: steps.db.outputs.changed == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+
+  # ---------------------------------------------------------------------------
   # One native build per image per architecture; scan gates before staging push
   # ---------------------------------------------------------------------------
   build:
-    needs: discover
+    needs: [discover, tools]
     if: needs.discover.outputs.any_images == 'true'
     strategy:
       fail-fast: false
@@ -116,14 +202,28 @@ jobs:
     runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Login
         run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+      - name: Restore layer cache
+        id: layers
+        uses: actions/cache/restore@v6
+        with:
+          path: /tmp/layers.tar.zst
+          key: layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-${{ github.run_id }}
+          restore-keys: |
+            layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-
+            layers-${{ matrix.image.lc }}-${{ matrix.arch }}-
+      - name: Load layer cache
+        if: steps.layers.outputs.cache-matched-key != ''
+        run: |
+          set -euo pipefail
+          podman unshare tar --zstd -xf /tmp/layers.tar.zst -C "$HOME/.local/share/containers"
+          rm -f /tmp/layers.tar.zst
       - name: Build
         working-directory: src/${{ matrix.image.component }}
         run: |
           set -euo pipefail
-          REPO_LC=${GITHUB_REPOSITORY,,}
           VCS_REF=$(git rev-parse --short HEAD)
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           LINE=$(grep -E 'podman build' buildCommand | grep -F "linux/${{ matrix.arch }}" | head -1)
@@ -131,29 +231,44 @@ jobs:
           while IFS= read -r pair; do
             [ -n "$pair" ] && EXTRA+=(--build-arg "$pair")
           done < <(printf '%s\n' "$LINE" | grep -oE -- '--build-arg [A-Za-z_]+=[^ ]+' | grep -vE 'VCS_REF|BUILD_DATE' | sed 's/^--build-arg //' || true)
-          CACHE="$REGISTRY/$REPO_LC/cache/${{ matrix.image.lc }}-${{ matrix.arch }}"
           podman build --platform "linux/${{ matrix.arch }}" --layers \
-            --cache-from "$CACHE" --cache-to "$CACHE" \
             --build-arg VCS_REF="$VCS_REF" --build-arg BUILD_DATE="$BUILD_DATE" \
             "${EXTRA[@]}" \
             -t "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}" \
             -f Containerfile .
-      - name: Cache vulnerability DB
-        uses: actions/cache@v4
+      - name: Pack layer cache
+        if: ${{ !cancelled() }}
+        run: podman unshare tar --zstd -cf /tmp/layers.tar.zst -C "$HOME/.local/share/containers" storage
+      - name: Save layer cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v6
+        with:
+          path: /tmp/layers.tar.zst
+          key: layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-${{ github.run_id }}
+      - name: Restore scan tools
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/scan-tools-${{ matrix.arch }}
+          key: scan-tools-${{ matrix.arch }}-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
+          fail-on-cache-miss: true
+      - name: Restore vulnerability DB
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/trivy
-          key: trivy-db-${{ matrix.arch }}-${{ github.run_number }}
-          restore-keys: trivy-db-${{ matrix.arch }}-
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+          fail-on-cache-miss: true
       - name: Scan and SBOM
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
         run: |
           set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.58.1
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.19.0
+          export PATH="$HOME/scan-tools-${{ matrix.arch }}:$PATH"
           podman save -o /tmp/image.tar "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}"
           trivy image --input /tmp/image.tar --severity CRITICAL --ignore-unfixed --exit-code 1
           syft "docker-archive:/tmp/image.tar" -o spdx-json > "sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json"
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}
           path: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json
@@ -190,6 +305,7 @@ jobs:
           podman manifest add list "docker://$DEST:${{ matrix.image.tag }}-arm64"
           podman manifest push list "docker://$DEST:${{ matrix.image.tag }}"
           podman manifest push list "docker://$DEST:${{ matrix.image.treetag }}"
+          podman manifest push list "docker://$DEST:latest"
 
   # ---------------------------------------------------------------------------
   # Verify and publish the chart as an OCI artifact
@@ -199,7 +315,7 @@ jobs:
     if: needs.discover.outputs.chart_needed == 'true' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify and package
         working-directory: src/charts/generic-stack
         run: |

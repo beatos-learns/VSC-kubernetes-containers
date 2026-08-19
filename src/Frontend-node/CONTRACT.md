@@ -19,9 +19,11 @@ runtime env `API_URL` (server-side only), the signup call is proxied through `/a
 browser only ever talks same-origin, the jwt cookie `secure` flag became env-derived, the
 third-party CDN avatar was replaced with a local asset, and `output: 'standalone'` was enabled.
 
-Base: `docker.io/library/node:24-slim` (digest-pinned) — documented exception to the base policy:
-a purpose-built runtime image chosen for the Node.js environment it ships. Consequence: the final
-image contains a shell and a package manager (documented exception to the shell-less preference).
+Base: `gcr.io/distroless/nodejs24-debian13` (digest-pinned) — documented exception to the base
+policy: a purpose-built runtime image chosen for the Node.js environment it ships. The final image
+is shell-less and has no package manager; the node binary lives at `/nodejs/bin/node` (not on
+PATH), so every exec into the container must use that absolute path. The build stage remains
+`node:24-slim`.
 
 ## Ports
 | Env        | Default | Purpose                                  |
@@ -53,7 +55,7 @@ the server starts listening.
 | next-server | the Next.js HTTP listener is up in this process                              |
 | backend-api | `${API_URL}/users` answers ANY HTTP response (reachability; 401/403 count as reachable) |
 
-Probe command: `node /app/ops/probe.cjs --endpoint=<startupz|livez|readyz>` (exit 0/1);
+Probe command: `/nodejs/bin/node /app/ops/probe.cjs --endpoint=<startupz|livez|readyz>` (exit 0/1);
 it targets 127.0.0.1 for wildcard binds, otherwise the configured BIND_ADDR.
 
 ## Deployment requirements

@@ -28,7 +28,7 @@ RUN pnpm build
 RUN install -d -m 1777 /src/.next/standalone/.next/cache
 
 # ---------------------------------------------------------------------------
-FROM docker.io/library/node:24-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+FROM gcr.io/distroless/nodejs24-debian13@sha256:2e3b3a96d1d7286c3e4727f9c84b4dc32b6b33e7d7d4425c5a5c8186ad85fa93
 ARG APP_UID
 ARG APP_GID
 ARG VERSION
@@ -50,4 +50,4 @@ ENV NODE_ENV=production \
     APP_REVISION=${VCS_REF}
 USER ${APP_UID}:${APP_GID}
 EXPOSE 3000 9090
-ENTRYPOINT ["node", "/app/ops/bootstrap.cjs"]
+ENTRYPOINT ["/nodejs/bin/node", "/app/ops/bootstrap.cjs"]
