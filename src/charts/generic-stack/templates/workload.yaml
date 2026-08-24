@@ -99,12 +99,13 @@ spec:
               containerPort: {{ .containerPort }}
               protocol: {{ .protocol | default "TCP" }}
             {{- end }}
-          {{- if or $spec.env $spec.secretEnv }}
+          {{- if $spec.env }}
+          envFrom:
+            - configMapRef:
+                name: {{ $fullname }}-env
+          {{- end }}
+          {{- if $spec.secretEnv }}
           env:
-            {{- range $k, $v := $spec.env }}
-            - name: {{ $k }}
-              value: {{ tpl (toString $v) $ | quote }}
-            {{- end }}
             {{- range $k, $key := $spec.secretEnv }}
             - name: {{ $k }}
               valueFrom:
