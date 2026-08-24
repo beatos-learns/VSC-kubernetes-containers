@@ -48,6 +48,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
+        "path": { "type": "string", "pattern": "^/" },
         "periodSeconds": { "type": "integer", "minimum": 1 },
         "failureThreshold": { "type": "integer", "minimum": 1 },
         "timeoutSeconds": { "type": "integer", "minimum": 1 },
@@ -61,6 +62,27 @@
         "enabled": { "type": "boolean" },
         "kind": { "enum": ["Deployment", "StatefulSet"] },
         "replicas": { "type": "integer", "minimum": 0 },
+        "hpa": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 1 },
+            "maxReplicas": { "type": "integer", "minimum": 1 },
+            "targetCPUUtilizationPercentage": { "type": ["integer", "null"], "minimum": 1 },
+            "targetMemoryUtilizationPercentage": { "type": ["integer", "null"], "minimum": 1 },
+            "behavior": { "type": "object" }
+          }
+        },
+        "pdb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minAvailable": { "type": ["integer", "string", "null"] },
+            "maxUnavailable": { "type": ["integer", "string", "null"] }
+          }
+        },
         "image": {
           "type": "object",
           "additionalProperties": false,
@@ -104,7 +126,8 @@
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
-            "mountPath": { "type": "string" }
+            "mountPath": { "type": "string" },
+            "keys": { "type": "array", "items": { "type": "string", "minLength": 1 } }
           }
         },
         "files": { "$ref": "#/definitions/stringMap" },
@@ -171,8 +194,27 @@
             "readiness": { "$ref": "#/definitions/probe" }
           }
         },
+        "monitoring": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "podMonitor": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "interval": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+                "labels": { "$ref": "#/definitions/stringMap" }
+              }
+            }
+          }
+        },
         "resources": { "type": "object" },
         "strategy": { "type": "object" },
+        "minReadySeconds": { "type": "integer", "minimum": 0 },
+        "antiAffinity": { "enum": ["none", "preferred", "required"] },
+        "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } },
+        "priorityClassName": { "type": "string" },
         "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
         "automountServiceAccountToken": { "type": "boolean" },
         "podSecurityContext": { "type": "object" },

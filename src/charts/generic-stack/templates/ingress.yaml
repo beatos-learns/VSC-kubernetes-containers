@@ -3,6 +3,9 @@
 {{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
 {{- if and $spec.enabled $spec.ingress.enabled }}
 {{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+{{- if not $spec.ingress.hosts }}
+{{- fail (printf "components.%s.ingress is enabled but ingress.hosts is empty" $name) }}
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -12,7 +15,7 @@ metadata:
     {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
   {{- with $spec.ingress.annotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
   {{- end }}
 spec:
   {{- with $spec.ingress.className }}

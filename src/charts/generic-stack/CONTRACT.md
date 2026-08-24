@@ -1,6 +1,6 @@
 # generic-stack — chart contract
 
-Chart: `generic-stack` 0.0.1 (retag/republish for your registry)
+Chart: `generic-stack` 0.0.3 (retag/republish for your registry)
 Artifact: OCI Helm chart, pushed to `oci://<registry>/charts` (see Publishing)
 Consumers: CD repositories (Argo CD, Flux, plain `helm upgrade --install`) that supply a
 values overlay per environment; the chart itself carries no environment-specific value.
@@ -17,12 +17,12 @@ new components without touching a template.
 Resources are rendered by ranging over `components.<name>`. Every component is deep-merged
 over `componentDefaults` (maps merge per key, lists and scalars replace), so a CD overlay
 only states differences. All resource names are `<release>-<component>`; `nameOverride`
-replaces the release-name part (note: the default cross-component URLs in `env`/`files` use
-`{{ .Release.Name }}-<component>` and must be overridden too when `nameOverride` is set).
+replaces the release-name part (the default cross-component URLs follow it).
 
-Strings in `env`, `secret`, `files`, `existingSecret`, `ingress.hosts[].host`, `initContainers`,
-`extraVolumes`, `extraVolumeMounts`, and `extraObjects` are rendered through `tpl` and may use
-template expressions.
+Strings in `env`, `secret`, `files`, `existingSecret`, `ingress.hosts[].host`, `ingress.tls`,
+`ingress.annotations`, `initContainers`, `extraVolumes`, `extraVolumeMounts`, and `extraObjects`
+are rendered through `tpl` and may use template expressions (the default cross-component URLs
+use `include "generic-stack.componentName"`, so they follow `nameOverride` and port changes).
 
 Values are validated against `values.schema.json` on every lint/template/install: unknown keys
 at the top level and inside a component are rejected (typo protection for CD overlays), enums
@@ -33,7 +33,10 @@ security contexts, extra volumes/containers) stay unvalidated by design.
 |-----|---------|---------|
 | `enabled` | true | Render this component at all |
 | `kind` | Deployment | `Deployment` or `StatefulSet` (StatefulSet gets a `-hl` headless service and `volumeClaimTemplates`) |
-| `replicas` | 1 | |
+| `replicas` | 1 | Ignored (omitted from the workload) when `hpa.enabled` |
+| `hpa.enabled` / `minReplicas` / `maxReplicas` | false / 1 / 3 | `autoscaling/v2` HorizontalPodAutoscaler on the workload; `replicas` is then omitted |
+| `hpa.targetCPUUtilizationPercentage` / `targetMemoryUtilizationPercentage` / `behavior` | 70 / — / {} | At least one utilization target, each requires the matching `resources.requests`; `behavior` is passed through verbatim |
+| `pdb.enabled` / `minAvailable` / `maxUnavailable` | false / — / — | `policy/v1` PodDisruptionBudget on the selector labels; exactly one of the two |
 | `image.registry` | "" | Falls back to `global.imageRegistry` |
 | `image.repository` / `tag` / `digest` | — | `repository` required; `digest` wins over `tag` |
 | `image.pullPolicy` | IfNotPresent | |
@@ -41,42 +44,51 @@ security contexts, extra volumes/containers) stay unvalidated by design.
 | `ports.main` | name/containerPort/servicePort/protocol | The traffic port (maps the image's `PORT`) |
 | `ports.admin` | admin/9090 | Probe + metrics port (`ADMIN_PORT`); probes are wired to it |
 | `ports.extra` | [] | Additional container/service ports |
-| `env` | {} | Plain env vars, tpl-rendered |
+| `env` | {} | Plain env vars, tpl-rendered; materialized as ConfigMap `<release>-<component>-env` and injected via `envFrom` (never secret material — use `secretEnv`) |
 | `secretEnv` | {} | `ENV_NAME: secret-key` — env from the component's secret |
 | `existingSecret` | "" | Use this pre-created Secret instead of rendering one |
 | `secret` | {} | `key: value` rendered into a Secret when `existingSecret` is unset |
-| `secretMount.enabled` / `mountPath` | false / /run/secrets | Mount the component's secret as files (preferred over env for secret material) |
+| `secretMount.enabled` / `mountPath` / `keys` | false / /run/secrets / [] | Mount the component's secret as files (preferred over env for secret material); `keys` projects only those keys (least privilege for shared Secrets) |
 | `files` | {} | `filename: content` rendered into a ConfigMap, tpl-rendered |
 | `filesMountPath` | "" | Where the files ConfigMap mounts (read-only) |
 | `persistence.enabled` | false | PVC (Deployment) or volumeClaimTemplate (StatefulSet); when disabled but `mountPath` is set, an emptyDir is mounted instead |
 | `persistence.mountPath` / `subPath` / `size` / `accessModes` / `storageClass` | — | `storageClass` falls back to `global.storageClass` |
 | `service.enabled` / `type` / `annotations` / `exposeAdmin` | true / ClusterIP / {} / false | |
-| `ingress.*` | disabled | Standard networking.k8s.io/v1 Ingress targeting the main port |
-| `probes.startup/liveness/readiness` | see values | HTTP GET `/startupz` `/livez` `/readyz` on the admin port; per-probe `enabled`, `periodSeconds`, `failureThreshold`, `timeoutSeconds`, `initialDelaySeconds` |
+| `ingress.*` | disabled | Standard networking.k8s.io/v1 Ingress targeting the main port; fails at render time when enabled without `hosts` |
+| `probes.startup/liveness/readiness` | see values | HTTP GET `/startupz` `/livez` `/readyz` on the admin port; per-probe `enabled`, `path`, `periodSeconds`, `failureThreshold`, `timeoutSeconds`, `initialDelaySeconds` |
+| `monitoring.podMonitor.enabled` / `interval` / `labels` | false / 30s / {} | `monitoring.coreos.com/v1` PodMonitor scraping `/metrics` on the admin port (needs the Prometheus Operator CRDs) |
 | `resources` | {} | |
-| `strategy` | {} | Deployment `strategy` / StatefulSet `updateStrategy` verbatim; a persistent Deployment defaults to `Recreate` |
+| `strategy` | {} | Deployment `strategy` / StatefulSet `updateStrategy` verbatim. Deployment default: `RollingUpdate` with `maxUnavailable: 0`, `maxSurge: 1` (zero-downtime); a persistent Deployment defaults to `Recreate` |
+| `minReadySeconds` | 0 | Rendered when > 0 |
+| `antiAffinity` | preferred | `none` / `preferred` / `required` hostname anti-affinity among the component's own pods; merged into `affinity` unless that already carries a `podAntiAffinity` |
+| `topologySpreadConstraints` | [] | Verbatim; `labelSelector` defaults to the component's selector labels when omitted |
+| `priorityClassName` | "" | |
 | `terminationGracePeriodSeconds` | 30 | Defaults per component already satisfy each image's documented minimum |
 | `automountServiceAccountToken` | false | |
 | `podSecurityContext` / `containerSecurityContext` | {} | Merged OVER the hardened baseline (non-root, read-only rootfs, all capabilities dropped, no privilege escalation, RuntimeDefault seccomp) |
 | `podAnnotations` / `podLabels` / `nodeSelector` / `tolerations` / `affinity` | | Pass-through |
 | `command` / `args` / `initContainers` / `extraVolumes` / `extraVolumeMounts` | | Pass-through (tpl-rendered where listed above) |
 
-Top level: `global.imageRegistry`, `global.imagePullSecrets`, `global.storageClass`,
+Top level: `global.imageRegistry`, `global.imagePullSecrets`, `global.storageClass` (other
+`global.*` keys are tolerated: Helm shares `global` across every chart of a release),
 `nameOverride`, `commonLabels`, `extraObjects` (list of raw manifests, tpl-rendered — the
 escape hatch for NetworkPolicies, ServiceMonitors, etc.).
 
 Every pod mounts an emptyDir at `/tmp` (all images run read-only and write only there plus
 their declared paths). A `checksum/config` pod annotation restarts workloads when their
-ConfigMap/Secret material changes.
+ConfigMap/Secret material (`files`, `env`, inline `secret`) changes. An `existingSecret` is
+outside the chart's view: after rotating it, `kubectl rollout restart` the consumers.
+`persistence.size` of a StatefulSet is immutable once created (expand the PVC directly;
+do-block-storage supports it) — changing the value afterwards makes the sync fail.
 
 ## Default components
 
 | Component | Image | Kind | Notes |
 |-----------|-------|------|-------|
 | db | postgresql:0.0.1 (PostgreSQL 16.15) | StatefulSet | PVC at `/var/lib/postgresql` (PGDATA is created beneath it by the supervisor); password read from the mounted secret key `db-password`; `filesMountPath` preset to `/docker-entrypoint-initdb.d` |
-| backend | user-mgmt-service:0.0.1 | Deployment | Wired to `<release>-db`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only) |
+| backend | user-mgmt-service:0.0.2 | Deployment | Wired to `<release>-db`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only) |
 | frontend | auth-portal:0.0.1 | Deployment | `API_URL` wired to `<release>-backend:8080` |
-| proxy | traefik:0.0.1 (Traefik v3.7.10) | Deployment, Service type LoadBalancer (80→8080, 443→8443) | Routes via the file provider: `files.routes.yaml` ConfigMap mounted at `/etc/traefik/dynamic`, default router → frontend; `/data` is an emptyDir until `persistence.enabled` (required for ACME) |
+| proxy | traefik:0.0.2 (Traefik v3.7.11) | Deployment, Service type LoadBalancer (80→8080, 443→8443) | Routes via the file provider: `files.routes.yaml` ConfigMap mounted at `/etc/traefik/dynamic`, default router → frontend; `/data` is an emptyDir until `persistence.enabled` (required for ACME) |
 
 ## What every deployment must supply
 
@@ -110,13 +122,14 @@ ConfigMap/Secret material changes.
 manifests encode each image's documented requirements: probe endpoints on the admin port,
 stop grace periods at or above the contract minimums (db 45 ≥ 40, backend/frontend 20 ≥ 15,
 proxy 25 ≥ 20), read-only rootfs, dropped capabilities, non-root fixed UIDs (10020–10023),
-tmpfs-style `/tmp`.
+tmpfs-style `/tmp`. The CI chart job additionally renders with `hpa`/`pdb` enabled and runs
+both variants through kubeconform.
 
 ## Publishing
 
 ```
 helm package . --destination dist
-helm push dist/generic-stack-0.0.1.tgz oci://<registry>/charts
+helm push dist/generic-stack-0.0.3.tgz oci://<registry>/charts
 ```
 For this repository `<registry>` is `ghcr.io/beatos-learns/vsc-kubernetes-containers`; the
 CI workflow derives it from the repository name and overrides `global.imageRegistry` at

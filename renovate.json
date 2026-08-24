@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "labels": ["dependencies"],
   "helm-values": { "enabled": false },
   "packageRules": [
@@ -26,10 +26,31 @@
     {
       "customType": "regex",
       "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
-      "matchStrings": [
-        "raw\\.githubusercontent\\.com/(?<depName>[^/]+/[^/]+)/main/(?:contrib/)?install\\.sh \\| sh -s -- -b \\S+ (?<currentValue>v[0-9][0-9.]*)",
-        "github\\.com/(?<depName>[^/]+/[^/]+)/releases/download/(?<currentValue>v[0-9][0-9.]*)/"
-      ],
+      "matchStrings": ["TRIVY_VERSION: (?<currentValue>[0-9][0-9.]*)"],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
+      "matchStrings": ["SYFT_VERSION: (?<currentValue>[0-9][0-9.]*)"],
+      "depNameTemplate": "anchore/syft",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
+      "matchStrings": ["cosign-release: (?<currentValue>v[0-9][0-9.]*)"],
+      "depNameTemplate": "sigstore/cosign",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
+      "matchStrings": ["HELM_VERSION: (?<currentValue>v[0-9][0-9.]*)"],
+      "depNameTemplate": "helm/helm",
       "datasourceTemplate": "github-releases"
     }
   ]

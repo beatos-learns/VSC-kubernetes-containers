@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 ARG APP_UID=10023
 ARG APP_GID=10023
-ARG VERSION=3.7.10
+ARG VERSION=3.7.11
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 ARG TARGETARCH
@@ -23,11 +23,11 @@ ARG APP_UID
 ARG APP_GID
 RUN microdnf install -y tar gzip tzdata && microdnf clean all
 RUN case "${TARGETARCH}" in \
-      amd64) SUM=01811bb12d44f17280550f425f5e3128d6c325f2665c09e67a651ca535f490ce ;; \
-      arm64) SUM=7035c7b31895f5b20c97064ac4c27dacc37e5523a89cb6bf6c16ee0cff9cee83 ;; \
+      amd64) SUM=0bd0b7152805af906a9feb5aec95e96322237d715ae89c4fe3adbbc07a63b631 ;; \
+      arm64) SUM=7b3c0469a2716974e7ec512c2c4d6071afcb1353531f09cb807ee5041d3d5c9e ;; \
       *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/traefik.tar.gz "https://github.com/traefik/traefik/releases/download/v3.7.10/traefik_v3.7.10_linux_${TARGETARCH}.tar.gz" \
+ && curl -fsSL -o /tmp/traefik.tar.gz "https://github.com/traefik/traefik/releases/download/v3.7.11/traefik_v3.7.11_linux_${TARGETARCH}.tar.gz" \
  && echo "${SUM} /tmp/traefik.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/traefik.tar.gz -C /tmp traefik
 RUN install -d -m 1777 /skel/tmp \

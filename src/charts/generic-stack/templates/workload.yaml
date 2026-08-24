@@ -7,6 +7,7 @@
 {{- $gid := required (printf "components.%s.security.gid is required" $name) $spec.security.gid }}
 {{- $secretName := include "generic-stack.secretName" (dict "root" $ "name" $name "spec" $spec) }}
 {{- $hasFiles := and $spec.files $spec.filesMountPath }}
+{{- $selector := include "generic-stack.selectorLabels" (dict "root" $ "name" $name) }}
 ---
 apiVersion: apps/v1
 kind: {{ $spec.kind }}
@@ -15,10 +16,15 @@ metadata:
   labels:
     {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
 spec:
+  {{- if not $spec.hpa.enabled }}
   replicas: {{ $spec.replicas }}
+  {{- end }}
+  {{- if gt (int $spec.minReadySeconds) 0 }}
+  minReadySeconds: {{ $spec.minReadySeconds }}
+  {{- end }}
   selector:
     matchLabels:
-      {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+      {{- $selector | nindent 6 }}
   {{- if eq $spec.kind "StatefulSet" }}
   serviceName: {{ $fullname }}-hl
   {{- with $spec.strategy }}
@@ -26,18 +32,22 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- else }}
-  {{- if $spec.strategy }}
   strategy:
+    {{- if $spec.strategy }}
     {{- toYaml $spec.strategy | nindent 4 }}
-  {{- else if $spec.persistence.enabled }}
-  strategy:
+    {{- else if $spec.persistence.enabled }}
     type: Recreate
-  {{- end }}
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
   {{- end }}
   template:
     metadata:
       labels:
-        {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 8 }}
+        {{- $selector | nindent 8 }}
         {{- with $spec.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -49,6 +59,9 @@ spec:
     spec:
       automountServiceAccountToken: {{ $spec.automountServiceAccountToken }}
       terminationGracePeriodSeconds: {{ $spec.terminationGracePeriodSeconds }}
+      {{- with $spec.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with $.Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -64,9 +77,23 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $spec.affinity }}
+      {{- $affinity := deepCopy $spec.affinity }}
+      {{- if and (ne $spec.antiAffinity "none") (not (hasKey $affinity "podAntiAffinity")) }}
+      {{- $affinity = mustMergeOverwrite (fromYaml (include "generic-stack.antiAffinity" (dict "root" $ "name" $name "mode" $spec.antiAffinity))) $affinity }}
+      {{- end }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $spec.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - {{- $c := deepCopy . }}
+          {{- if not (hasKey $c "labelSelector") }}
+          {{- $_ := set $c "labelSelector" (dict "matchLabels" (fromYaml $selector)) }}
+          {{- end }}
+          {{- toYaml $c | nindent 10 }}
+        {{- end }}
       {{- end }}
       {{- with $spec.initContainers }}
       initContainers:
@@ -165,6 +192,13 @@ spec:
         - name: secret
           secret:
             secretName: {{ $secretName }}
+            {{- with $spec.secretMount.keys }}
+            items:
+              {{- range . }}
+              - key: {{ . }}
+                path: {{ . }}
+              {{- end }}
+            {{- end }}
         {{- end }}
         {{- if $spec.persistence.mountPath }}
         {{- if and $spec.persistence.enabled (eq $spec.kind "Deployment") }}

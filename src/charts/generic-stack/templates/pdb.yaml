@@ -1,0 +1,27 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.pdb.enabled }}
+{{- $hasMin := not (kindIs "invalid" $spec.pdb.minAvailable) }}
+{{- $hasMax := not (kindIs "invalid" $spec.pdb.maxUnavailable) }}
+{{- if eq $hasMin $hasMax }}
+{{- fail (printf "components.%s.pdb: set exactly one of minAvailable / maxUnavailable" $name) }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+spec:
+  {{- if $hasMin }}
+  minAvailable: {{ $spec.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $spec.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "generic-stack.selectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}

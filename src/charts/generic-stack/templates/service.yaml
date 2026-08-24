@@ -1,8 +1,9 @@
 {{/* ------------------------------------------------------------------------ */}}
 {{- range $name, $raw := .Values.components }}
 {{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
-{{- if and $spec.enabled $spec.service.enabled }}
+{{- if $spec.enabled }}
 {{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+{{- if $spec.service.enabled }}
 ---
 apiVersion: v1
 kind: Service
@@ -35,6 +36,8 @@ spec:
       targetPort: {{ .name }}
       protocol: {{ .protocol | default "TCP" }}
     {{- end }}
+{{- end }}
+{{/* The headless Service is a StatefulSet requirement (serviceName), not optional */}}
 {{- if eq $spec.kind "StatefulSet" }}
 ---
 apiVersion: v1
