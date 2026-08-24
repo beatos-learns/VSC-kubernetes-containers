@@ -43,7 +43,7 @@ is all specified there
 | src/Frontend | auth-portal | 0.0.1 | auth_portal 0.1.0 (static export + Go server) | 10022 |
 | src/Frontend-node | auth-portal | 0.0.1-node | auth_portal 0.1.0 (Node.js runtime variant) | 10022 |
 | src/Proxy | traefik | 0.0.1 | Traefik v3.7.10 | 10023 |
-| src/charts/generic-stack | charts/generic-stack | 0.0.1 | — | — |
+| src/charts/generic-stack | charts/generic-stack | 0.0.3 | — | — |
 
 * The **tag is the artifact version** (this repo's build)
 * the **OCI `image.version` label is the packaged software's version**

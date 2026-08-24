@@ -1,6 +1,6 @@
 # generic-stack — chart contract
 
-Chart: `generic-stack` 0.0.1 (retag/republish for your registry)
+Chart: `generic-stack` 0.0.3 (retag/republish for your registry)
 Artifact: OCI Helm chart, pushed to `oci://<registry>/charts` (see Publishing)
 Consumers: CD repositories (Argo CD, Flux, plain `helm upgrade --install`) that supply a
 values overlay per environment; the chart itself carries no environment-specific value.
@@ -41,7 +41,7 @@ security contexts, extra volumes/containers) stay unvalidated by design.
 | `ports.main` | name/containerPort/servicePort/protocol | The traffic port (maps the image's `PORT`) |
 | `ports.admin` | admin/9090 | Probe + metrics port (`ADMIN_PORT`); probes are wired to it |
 | `ports.extra` | [] | Additional container/service ports |
-| `env` | {} | Plain env vars, tpl-rendered |
+| `env` | {} | Plain env vars, tpl-rendered; materialized as ConfigMap `<release>-<component>-env` and injected via `envFrom` (never secret material — use `secretEnv`) |
 | `secretEnv` | {} | `ENV_NAME: secret-key` — env from the component's secret |
 | `existingSecret` | "" | Use this pre-created Secret instead of rendering one |
 | `secret` | {} | `key: value` rendered into a Secret when `existingSecret` is unset |
@@ -67,7 +67,7 @@ escape hatch for NetworkPolicies, ServiceMonitors, etc.).
 
 Every pod mounts an emptyDir at `/tmp` (all images run read-only and write only there plus
 their declared paths). A `checksum/config` pod annotation restarts workloads when their
-ConfigMap/Secret material changes.
+ConfigMap/Secret material (`files`, `env`, inline `secret`) changes.
 
 ## Default components
 
@@ -116,7 +116,7 @@ tmpfs-style `/tmp`.
 
 ```
 helm package . --destination dist
-helm push dist/generic-stack-0.0.1.tgz oci://<registry>/charts
+helm push dist/generic-stack-0.0.3.tgz oci://<registry>/charts
 ```
 For this repository `<registry>` is `ghcr.io/beatos-learns/vsc-kubernetes-containers`; the
 CI workflow derives it from the repository name and overrides `global.imageRegistry` at
