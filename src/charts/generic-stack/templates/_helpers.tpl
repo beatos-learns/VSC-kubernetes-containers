@@ -51,7 +51,7 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 
 {{/* ------------------------------------------------------------------------ */}}
 {{- define "generic-stack.configChecksum" -}}
-{{- $parts := list (tpl (toYaml .spec.files) .root) -}}
+{{- $parts := list (tpl (toYaml .spec.files) .root) (tpl (toYaml .spec.env) .root) -}}
 {{- if not .spec.existingSecret -}}
 {{- $parts = append $parts (tpl (toYaml .spec.secret) .root) -}}
 {{- end -}}

@@ -1,0 +1,17 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.env }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "generic-stack.componentName" (dict "root" $ "name" $name) }}-env
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+data:
+{{- range $k, $v := $spec.env }}
+  {{ $k }}: {{ tpl (toString $v) $ | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
