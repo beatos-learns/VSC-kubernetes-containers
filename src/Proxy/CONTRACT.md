@@ -1,15 +1,15 @@
 # traefik — image contract
 
-Image: localhost/traefik:0.0.1 (Traefik v3.7.10; retag for your registry — the OCI version
+Image: localhost/traefik:0.0.2 (Traefik v3.7.11; retag for your registry — the OCI version
 label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10023:10023 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: checker is parent (`traefiksupervisor`, PID 1), traefik is its child
 Checker runtime: static Go binary (no interpreter or extra runtime in the image)
 Layer format: OCI, zstd:chunked (applied at push, see Publishing)
 
-Content: the official Traefik v3.7.10 release binary (per-architecture tarball, sha256 pinned from
+Content: the official Traefik v3.7.11 release binary (per-architecture tarball, sha256 pinned from
 the release's checksums file), CA trust bundle and zoneinfo from a digest-pinned AlmaLinux 10
-minimal stage, shipped `FROM scratch`. v3.7.10 includes the 2026-07-31 ACME/middleware security
+minimal stage, shipped `FROM scratch`. v3.7.11 includes the 2026-07-31 ACME/middleware security
 fixes.
 
 ## Ports
@@ -96,5 +96,5 @@ documented requirement)
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/traefik:0.0.1 docker://<registry>/traefik:0.0.1
+  localhost/traefik:0.0.2 docker://<registry>/traefik:0.0.2
 ```

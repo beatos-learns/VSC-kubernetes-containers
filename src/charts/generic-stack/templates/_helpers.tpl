@@ -61,7 +61,7 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{/* ------------------------------------------------------------------------ */}}
 {{- define "generic-stack.probe" -}}
 httpGet:
-  path: {{ .path }}
+  path: {{ .cfg.path | default .path }}
   port: {{ .port }}
 periodSeconds: {{ .cfg.periodSeconds }}
 failureThreshold: {{ .cfg.failureThreshold }}
@@ -69,4 +69,21 @@ timeoutSeconds: {{ .cfg.timeoutSeconds }}
 {{- with .cfg.initialDelaySeconds }}
 initialDelaySeconds: {{ . }}
 {{- end }}
+{{- end -}}
+
+{{/* ------------------------------------------------------------------------ */}}
+{{/* Pod anti-affinity among the component's own replicas (hostname topology) */}}
+{{- define "generic-stack.antiAffinity" -}}
+{{- $term := dict "labelSelector" (dict "matchLabels" (fromYaml (include "generic-stack.selectorLabels" .))) "topologyKey" "kubernetes.io/hostname" -}}
+{{- if eq .mode "required" -}}
+podAntiAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    - {{ toYaml $term | nindent 6 | trim }}
+{{- else -}}
+podAntiAffinity:
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        {{- toYaml $term | nindent 8 }}
+{{- end -}}
 {{- end -}}

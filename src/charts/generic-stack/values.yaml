@@ -17,6 +17,17 @@ componentDefaults:
   enabled: true
   kind: Deployment
   replicas: 1
+  hpa:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null
+    behavior: {}
+  pdb:
+    enabled: false
+    minAvailable: null
+    maxUnavailable: null
   image:
     registry: ""
     repository: ""
@@ -43,6 +54,8 @@ componentDefaults:
   secretMount:
     enabled: false
     mountPath: /run/secrets
+    # project only these keys of the Secret (empty = every key)
+    keys: []
   files: {}
   filesMountPath: ""
   persistence:
@@ -67,21 +80,37 @@ componentDefaults:
   probes:
     startup:
       enabled: true
+      path: /startupz
       periodSeconds: 5
       failureThreshold: 36
       timeoutSeconds: 2
     liveness:
       enabled: true
+      path: /livez
       periodSeconds: 10
       failureThreshold: 3
       timeoutSeconds: 2
     readiness:
       enabled: true
+      path: /readyz
       periodSeconds: 5
       failureThreshold: 2
       timeoutSeconds: 2
+  monitoring:
+    podMonitor:
+      enabled: false
+      interval: 30s
+      labels: {}
   resources: {}
+  # Deployment: verbatim `strategy`; unset = RollingUpdate maxUnavailable 0 /
+  # maxSurge 1 (Recreate when persistence is enabled). StatefulSet: updateStrategy.
   strategy: {}
+  minReadySeconds: 0
+  # none | preferred | required — hostname anti-affinity among the component's
+  # own pods; merged into `affinity` unless that already has a podAntiAffinity
+  antiAffinity: preferred
+  topologySpreadConstraints: []
+  priorityClassName: ""
   terminationGracePeriodSeconds: 30
   automountServiceAccountToken: false
   podSecurityContext: {}
@@ -134,7 +163,7 @@ components:
   backend:
     image:
       repository: user-mgmt-service
-      tag: "0.0.1"
+      tag: "0.0.2"
     security:
       uid: 10021
       gid: 10021
@@ -145,8 +174,8 @@ components:
         servicePort: 8080
         protocol: TCP
     env:
-      SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ .Release.Name }}-db:5432/app"
-      SPRING_DATASOURCE_USERNAME: app
+      SPRING_DATASOURCE_URL: 'jdbc:postgresql://{{ include "generic-stack.componentName" (dict "root" . "name" "db") }}:{{ .Values.components.db.ports.main.servicePort }}/{{ .Values.components.db.env.POSTGRES_DB }}'
+      SPRING_DATASOURCE_USERNAME: '{{ .Values.components.db.env.POSTGRES_USER }}'
       SPRING_JPA_HIBERNATE_DDL_AUTO: update
       JWT_ISSUER: user-mgmt-service
       JWT_EXPIRATION_MILLIS: "3600000"
@@ -169,13 +198,13 @@ components:
         servicePort: 3000
         protocol: TCP
     env:
-      API_URL: "http://{{ .Release.Name }}-backend:8080"
+      API_URL: 'http://{{ include "generic-stack.componentName" (dict "root" . "name" "backend") }}:{{ .Values.components.backend.ports.main.servicePort }}'
     terminationGracePeriodSeconds: 20
 
   proxy:
     image:
       repository: traefik
-      tag: "0.0.1"
+      tag: "0.0.2"
     security:
       uid: 10023
       gid: 10023
@@ -203,7 +232,7 @@ components:
             frontend:
               loadBalancer:
                 servers:
-                  - url: "http://{{ .Release.Name }}-frontend:3000"
+                  - url: "http://{{ include "generic-stack.componentName" (dict "root" . "name" "frontend") }}:{{ .Values.components.frontend.ports.main.servicePort }}"
     filesMountPath: /etc/traefik/dynamic
     persistence:
       enabled: false

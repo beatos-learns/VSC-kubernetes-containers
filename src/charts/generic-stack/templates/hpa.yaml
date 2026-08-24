@@ -1,0 +1,56 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- if and $spec.enabled $spec.hpa.enabled }}
+{{- $fullname := include "generic-stack.componentName" (dict "root" $ "name" $name) }}
+{{- $cpu := $spec.hpa.targetCPUUtilizationPercentage }}
+{{- $mem := $spec.hpa.targetMemoryUtilizationPercentage }}
+{{- if not (or $cpu $mem) }}
+{{- fail (printf "components.%s.hpa: set targetCPUUtilizationPercentage and/or targetMemoryUtilizationPercentage" $name) }}
+{{- end }}
+{{- if and $cpu (not (dig "requests" "cpu" "" $spec.resources)) }}
+{{- fail (printf "components.%s.hpa: targetCPUUtilizationPercentage requires resources.requests.cpu" $name) }}
+{{- end }}
+{{- if and $mem (not (dig "requests" "memory" "" $spec.resources)) }}
+{{- fail (printf "components.%s.hpa: targetMemoryUtilizationPercentage requires resources.requests.memory" $name) }}
+{{- end }}
+{{- if gt (int $spec.hpa.minReplicas) (int $spec.hpa.maxReplicas) }}
+{{- fail (printf "components.%s.hpa: minReplicas (%d) > maxReplicas (%d)" $name (int $spec.hpa.minReplicas) (int $spec.hpa.maxReplicas)) }}
+{{- end }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: {{ $spec.kind }}
+    name: {{ $fullname }}
+  minReplicas: {{ $spec.hpa.minReplicas }}
+  maxReplicas: {{ $spec.hpa.maxReplicas }}
+  metrics:
+    {{- with $cpu }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- with $mem }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+  {{- with $spec.hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

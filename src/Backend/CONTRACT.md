@@ -1,6 +1,6 @@
 # user-mgmt-service — image contract
 
-Image: localhost/user-mgmt-service:0.0.1 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
+Image: localhost/user-mgmt-service:0.0.2 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
 registry — the OCI version label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10021:10021 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (the native binary serves endpoints, checker loop, signals, probe subcommand)
@@ -88,5 +88,5 @@ grace period granted was below the documented requirement)
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/user-mgmt-service:0.0.1 docker://<registry>/user-mgmt-service:0.0.1
+  localhost/user-mgmt-service:0.0.2 docker://<registry>/user-mgmt-service:0.0.2
 ```

@@ -8,17 +8,17 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild and republish everything, ignoring up-to-date checks
+        description: Rebuild and republish everything, ignoring up-to-date and immutability checks
         type: boolean
         default: false
 
-permissions:
-  contents: read
-  packages: write
+# least privilege: every job declares what it needs
+permissions: {}
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # never abort a publish on the default branch half-way; PR runs may be superseded
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -28,37 +28,75 @@ env:
   REGISTRY: ghcr.io
   TRIVY_VERSION: 0.74.0
   SYFT_VERSION: 1.19.0
+  HELM_VERSION: v3.21.4
+  # bump version and checksum together (CHECKSUMS file of the release)
+  KUBECONFORM_VERSION: v0.8.0
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+  KUBERNETES_VERSION: "1.33.1" # keep in sync with the ops repo's validate.yml
+  CRD_SCHEMAS: 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+  COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  # artifacts are published and signed only from the default branch (never from a dispatch on a feature branch)
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Determine which artifacts are out of date (registry state vs git tree hash)
+  # Determine which artifacts are out of date (registry state vs git tree hash).
+  # Published version tags are immutable: a tree change without a tag bump fails.
   # ---------------------------------------------------------------------------
   discover:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     outputs:
+      publish: ${{ steps.plan.outputs.publish }}
       images: ${{ steps.plan.outputs.images }}
       any_images: ${{ steps.plan.outputs.any_images }}
+      all_images: ${{ steps.plan.outputs.all_images }}
       chart_needed: ${{ steps.plan.outputs.chart_needed }}
       chart_version: ${{ steps.plan.outputs.chart_version }}
       chart_treetag: ${{ steps.plan.outputs.chart_treetag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Login
-        run: skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
       - name: Plan
         id: plan
         run: |
           set -euo pipefail
           REPO_LC=${GITHUB_REPOSITORY,,}
           FORCE="${{ github.event.inputs.force || 'false' }}"
-          up_to_date() {
-            local dest=$1 tag=$2 treetag=$3 dt dv
-            dt=$(skopeo inspect --format '{{.Digest}}' "docker://$dest:$treetag" 2>/dev/null || true)
-            dv=$(skopeo inspect --format '{{.Digest}}' "docker://$dest:$tag" 2>/dev/null || true)
-            [ -n "$dt" ] && [ "$dt" = "$dv" ]
+          command -v skopeo >/dev/null
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then publish=true; fi
+          # manifest digest of a tag (the index digest for multi-arch images; works for OCI
+          # artifacts such as the chart); empty when the tag does not exist; any other
+          # registry error fails the run
+          digest_of() {
+            local ref=$1 err
+            if skopeo inspect --raw "docker://$ref" > /tmp/manifest.json 2>/tmp/skopeo.err; then
+              printf 'sha256:%s' "$(sha256sum /tmp/manifest.json | cut -d' ' -f1)"; return 0
+            fi
+            err=$(cat /tmp/skopeo.err)
+            # GHCR answers NAME_UNKNOWN/denied for packages that do not exist yet
+            if grep -qE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest unknown|name unknown|denied' <<< "$err"; then return 0; fi
+            echo "::error::skopeo inspect $ref: $err" >&2; return 1
+          }
+          # 0 = up to date, 1 = build needed; exits the run when the tag is already taken by other content
+          plan_artifact() {
+            local dest=$1 tag=$2 treetag=$3 label=$4 dt dv
+            dv=$(digest_of "$dest:$tag") || exit 1
+            dt=$(digest_of "$dest:$treetag") || exit 1
+            [ -z "$dv" ] && return 1
+            [ "$dt" = "$dv" ] && return 0
+            [ "$FORCE" = "true" ] && return 1
+            echo "::error::$label: $dest:$tag is already published from a different source tree (or a publish was interrupted) - version tags are immutable: bump the tag, or re-run the failed job, or run with force=true" >&2
+            exit 1
           }
           CHART_VALUES=src/charts/generic-stack/values.yaml
-          entries=()
+          entries=(); all=()
           mismatch=0
           for dir in src/*/; do
             comp=$(basename "$dir")
@@ -76,33 +114,33 @@ jobs:
             fi
             tree=$(git rev-parse "HEAD:src/$comp")
             treetag="tree-${tree:0:16}"
-            if [ "$FORCE" != "true" ] && up_to_date "$REGISTRY/$REPO_LC/$name" "$tag" "$treetag"; then
+            all+=("{\"component\":\"$comp\",\"lc\":\"$lc\",\"name\":\"$name\",\"tag\":\"$tag\",\"treetag\":\"$treetag\"}")
+            if plan_artifact "$REGISTRY/$REPO_LC/$name" "$tag" "$treetag" "src/$comp"; then
               echo "up to date: $comp ($name:$tag @ $treetag)"
-              if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && ! up_to_date "$REGISTRY/$REPO_LC/$name" "$tag" "latest"; then
-                echo "repointing latest: $comp ($name:$tag)"
-                skopeo copy --all "docker://$REGISTRY/$REPO_LC/$name:$tag" "docker://$REGISTRY/$REPO_LC/$name:latest"
-              fi
               continue
             fi
             echo "needs build: $comp ($name:$tag @ $treetag)"
-            entries+=("{\"component\":\"$comp\",\"lc\":\"${comp,,}\",\"name\":\"$name\",\"tag\":\"$tag\",\"treetag\":\"$treetag\"}")
+            entries+=("{\"component\":\"$comp\",\"lc\":\"$lc\",\"name\":\"$name\",\"tag\":\"$tag\",\"treetag\":\"$treetag\"}")
           done
           if [ "$mismatch" != "0" ]; then
             echo "consistency gate failed: chart image pins and buildCommand tags disagree"
             exit 1
           fi
           images=$(printf '%s\n' "${entries[@]:-}" | jq -sc '.')
+          all_images=$(printf '%s\n' "${all[@]}" | jq -sc '.')
 
           chart_version=$(grep -E '^version:' src/charts/generic-stack/Chart.yaml | awk '{print $2}')
           chart_tree=$(git rev-parse "HEAD:src/charts/generic-stack")
           chart_treetag="tree-${chart_tree:0:16}"
           chart_needed=true
-          if [ "$FORCE" != "true" ] && up_to_date "$REGISTRY/$REPO_LC/charts/generic-stack" "$chart_version" "$chart_treetag"; then
+          if plan_artifact "$REGISTRY/$REPO_LC/charts/generic-stack" "$chart_version" "$chart_treetag" "src/charts/generic-stack"; then
             chart_needed=false
           fi
           {
+            echo "publish=$publish"
             echo "images=$images"
             echo "any_images=$([ "$images" != "[]" ] && echo true || echo false)"
+            echo "all_images=$all_images"
             echo "chart_needed=$chart_needed"
             echo "chart_version=$chart_version"
             echo "chart_treetag=$chart_treetag"
@@ -116,16 +154,18 @@ jobs:
     needs: discover
     if: needs.discover.outputs.any_images == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      packages: read
     steps:
       - name: Restore amd64 tools
         id: amd64
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/scan-tools-amd64
           key: scan-tools-amd64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
       - name: Probe arm64 tools
         id: arm64
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/scan-tools-arm64
           key: scan-tools-arm64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
@@ -134,16 +174,18 @@ jobs:
         if: steps.amd64.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p ~/scan-tools-amd64
-          curl -sSfL --retry 3 --retry-delay 5 \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-            | tar -xz -C ~/scan-tools-amd64 trivy
-          curl -sSfL --retry 3 --retry-delay 5 \
-            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
-            | tar -xz -C ~/scan-tools-amd64 syft
+          mkdir -p ~/scan-tools-amd64 /tmp/dl && cd /tmp/dl
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt"
+          grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -C ~/scan-tools-amd64 trivy
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_checksums.txt"
+          grep "syft_${SYFT_VERSION}_linux_amd64.tar.gz" "syft_${SYFT_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "syft_${SYFT_VERSION}_linux_amd64.tar.gz" -C ~/scan-tools-amd64 syft
       - name: Save amd64 tools
         if: steps.amd64.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/scan-tools-amd64
           key: scan-tools-amd64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
@@ -151,21 +193,23 @@ jobs:
         if: steps.arm64.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p ~/scan-tools-arm64
-          curl -sSfL --retry 3 --retry-delay 5 \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" \
-            | tar -xz -C ~/scan-tools-arm64 trivy
-          curl -sSfL --retry 3 --retry-delay 5 \
-            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_arm64.tar.gz" \
-            | tar -xz -C ~/scan-tools-arm64 syft
+          mkdir -p ~/scan-tools-arm64 /tmp/dl-arm && cd /tmp/dl-arm
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt"
+          grep "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" -C ~/scan-tools-arm64 trivy
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_arm64.tar.gz"
+          curl -sSfL --retry 3 --retry-delay 5 -O "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_checksums.txt"
+          grep "syft_${SYFT_VERSION}_linux_arm64.tar.gz" "syft_${SYFT_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "syft_${SYFT_VERSION}_linux_arm64.tar.gz" -C ~/scan-tools-arm64 syft
       - name: Save arm64 tools
         if: steps.arm64.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/scan-tools-arm64
           key: scan-tools-arm64-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
       - name: Restore vulnerability DB
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ github.run_id }}
@@ -183,7 +227,7 @@ jobs:
           echo "changed=$([ "$before" != "$after" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Save vulnerability DB
         if: steps.db.outputs.changed == 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ github.run_id }}
@@ -194,6 +238,9 @@ jobs:
   build:
     needs: [discover, tools]
     if: needs.discover.outputs.any_images == 'true'
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -202,18 +249,20 @@ jobs:
     runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Login
-        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
       - name: Restore layer cache
         id: layers
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/layers.tar.zst
           key: layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-${{ github.run_id }}
+          # only caches produced from the same source tree are trusted for reuse
           restore-keys: |
             layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-
-            layers-${{ matrix.image.lc }}-${{ matrix.arch }}-
       - name: Load layer cache
         if: steps.layers.outputs.cache-matched-key != ''
         run: |
@@ -241,18 +290,18 @@ jobs:
         run: podman unshare tar --zstd -cf /tmp/layers.tar.zst -C "$HOME/.local/share/containers" storage
       - name: Save layer cache
         if: ${{ !cancelled() }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/layers.tar.zst
           key: layers-${{ matrix.image.lc }}-${{ matrix.arch }}-${{ matrix.image.treetag }}-${{ github.run_id }}
       - name: Restore scan tools
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/scan-tools-${{ matrix.arch }}
           key: scan-tools-${{ matrix.arch }}-trivy-${{ env.TRIVY_VERSION }}-syft-${{ env.SYFT_VERSION }}
           fail-on-cache-miss: true
       - name: Restore vulnerability DB
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ github.run_id }}
@@ -261,19 +310,20 @@ jobs:
       - name: Scan and SBOM
         env:
           TRIVY_SKIP_DB_UPDATE: "true"
+        # HIGH+CRITICAL gate; accepted findings live in .trivyignore with an expiry date
         run: |
           set -euo pipefail
           export PATH="$HOME/scan-tools-${{ matrix.arch }}:$PATH"
           podman save -o /tmp/image.tar "localhost/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}"
-          trivy image --input /tmp/image.tar --severity CRITICAL --ignore-unfixed --exit-code 1
+          trivy image --input /tmp/image.tar --severity HIGH,CRITICAL --ignore-unfixed --ignorefile .trivyignore --exit-code 1
           syft "docker-archive:/tmp/image.tar" -o spdx-json > "sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json"
       - name: Upload SBOM
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}
           path: sbom-${{ matrix.image.lc }}-${{ matrix.arch }}.spdx.json
       - name: Push architecture image
-        if: github.event_name != 'pull_request'
+        if: needs.discover.outputs.publish == 'true'
         run: |
           set -euo pipefail
           REPO_LC=${GITHUB_REPOSITORY,,}
@@ -282,11 +332,14 @@ jobs:
             "docker://$REGISTRY/$REPO_LC/${{ matrix.image.name }}:${{ matrix.image.tag }}-${{ matrix.arch }}"
 
   # ---------------------------------------------------------------------------
-  # Assemble and publish the multi-arch manifest lists (version + tree tags)
+  # Assemble and publish the multi-arch manifest lists (version + tree tags).
+  # No floating `latest`: consumers pin versions (and verify signatures).
   # ---------------------------------------------------------------------------
   manifest:
     needs: [discover, build]
-    if: needs.discover.outputs.any_images == 'true' && github.event_name != 'pull_request'
+    if: needs.discover.outputs.any_images == 'true' && needs.discover.outputs.publish == 'true'
+    permissions:
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -294,7 +347,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Login
-        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: podman login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
       - name: Publish manifest list
         run: |
           set -euo pipefail
@@ -303,9 +358,9 @@ jobs:
           podman manifest create list
           podman manifest add list "docker://$DEST:${{ matrix.image.tag }}-amd64"
           podman manifest add list "docker://$DEST:${{ matrix.image.tag }}-arm64"
-          podman manifest push list "docker://$DEST:${{ matrix.image.tag }}"
+          # tree tag first: an interrupted publish then reads as "needs build", not as an immutability violation
           podman manifest push list "docker://$DEST:${{ matrix.image.treetag }}"
-          podman manifest push list "docker://$DEST:latest"
+          podman manifest push list "docker://$DEST:${{ matrix.image.tag }}"
 
   # ---------------------------------------------------------------------------
   # Verify and publish the chart as an OCI artifact
@@ -314,32 +369,122 @@ jobs:
     needs: [discover, manifest]
     if: needs.discover.outputs.chart_needed == 'true' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  /tmp/kubeconform.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/kubeconform.tgz -C /usr/local/bin kubeconform
       - name: Verify and package
         working-directory: src/charts/generic-stack
         run: |
           set -euo pipefail
           REPO_LC=${GITHUB_REPOSITORY,,}
-          curl -sSfL -o /usr/local/bin/kubeconform.tgz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
-          tar -xzf /usr/local/bin/kubeconform.tgz -C /usr/local/bin kubeconform
           sed -i "s|^  imageRegistry: .*|  imageRegistry: $REGISTRY/$REPO_LC|" values.yaml
-          helm lint .
-          helm template ci . \
-            --set components.db.secret.db-password=x \
-            --set components.backend.secret.db-password=x \
-            --set components.backend.secret.jwt-secret=x \
-            | kubeconform -strict -summary
+          helm lint . --strict
+          base=(--set components.db.secret.db-password=x --set components.backend.secret.db-password=x --set components.backend.secret.jwt-secret=x)
+          kc=(kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" -schema-location default -schema-location "$CRD_SCHEMAS")
+          helm template ci . "${base[@]}" | "${kc[@]}"
+          helm template ci . "${base[@]}" \
+            --set components.backend.hpa.enabled=true --set components.backend.resources.requests.cpu=100m \
+            --set components.backend.pdb.enabled=true --set components.backend.pdb.maxUnavailable=1 \
+            --set components.backend.antiAffinity=required \
+            | "${kc[@]}"
+          helm template ci . "${base[@]}" \
+            --set components.backend.monitoring.podMonitor.enabled=true \
+            | "${kc[@]}"
           helm package . --destination dist
       - name: Push chart
-        if: github.event_name != 'pull_request'
+        if: needs.discover.outputs.publish == 'true'
         working-directory: src/charts/generic-stack
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           REPO_LC=${GITHUB_REPOSITORY,,}
-          helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
-          skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
           helm push "dist/generic-stack-${{ needs.discover.outputs.chart_version }}.tgz" "oci://$REGISTRY/$REPO_LC/charts"
           skopeo copy \
             "docker://$REGISTRY/$REPO_LC/charts/generic-stack:${{ needs.discover.outputs.chart_version }}" \
             "docker://$REGISTRY/$REPO_LC/charts/generic-stack:${{ needs.discover.outputs.chart_treetag }}"
+
+  # ---------------------------------------------------------------------------
+  # Keyless (OIDC) signatures for EVERY published version tag of every artifact
+  # (images and chart, current and older tags) plus SBOM attestations for what
+  # was rebuilt in this run. Idempotent: already-signed digests are skipped.
+  # ---------------------------------------------------------------------------
+  sign:
+    needs: [discover, manifest, chart]
+    if: needs.discover.outputs.publish == 'true' && !failure() && !cancelled()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - name: Download SBOMs of this run
+        if: needs.discover.outputs.any_images == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: sbom-*
+          path: sboms
+          merge-multiple: true
+      - name: Login
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          skopeo login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          cosign login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
+      - name: Sign and attest
+        env:
+          ALL_IMAGES: ${{ needs.discover.outputs.all_images }}
+          CHART_VERSION: ${{ needs.discover.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          IDENTITY_RE="^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build.yml@refs/heads/(master|main)$"
+          sign_ref() {
+            local ref=$1 digest target
+            skopeo inspect --raw "docker://$ref" > /tmp/manifest.json
+            digest="sha256:$(sha256sum /tmp/manifest.json | cut -d' ' -f1)"
+            target="${ref%:*}@$digest"
+            if cosign verify --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" --certificate-identity-regexp "$IDENTITY_RE" "$target" >/dev/null 2>&1; then
+              echo "already signed: $ref" >&2
+            else
+              cosign sign --yes "$target" >&2
+              echo "signed: $ref ($digest)" >&2
+            fi
+            printf '%s' "$target"
+          }
+          # every version tag (not tree markers, not per-arch tags) of every artifact
+          version_tags() {
+            skopeo list-tags "docker://$1" | jq -r '.Tags[]' | grep -vE '^tree-|^latest$|-(amd64|arm64)$' || true
+          }
+          for entry in $(jq -c '.[]' <<< "$ALL_IMAGES"); do
+            name=$(jq -r .name <<< "$entry"); tag=$(jq -r .tag <<< "$entry"); lc=$(jq -r .lc <<< "$entry")
+            for t in $(version_tags "$REGISTRY/$REPO_LC/$name" | sort -u); do
+              target=$(sign_ref "$REGISTRY/$REPO_LC/$name:$t")
+              [ "$t" = "$tag" ] || continue
+              for arch in amd64 arm64; do
+                f="sboms/sbom-$lc-$arch.spdx.json"
+                [ -f "$f" ] || continue
+                cosign attest --yes --type spdxjson --predicate "$f" "$target"
+                echo "attested SBOM ($arch): $name:$tag"
+              done
+            done
+          done
+          for t in $(version_tags "$REGISTRY/$REPO_LC/charts/generic-stack" | sort -u); do
+            sign_ref "$REGISTRY/$REPO_LC/charts/generic-stack:$t" >/dev/null
+          done

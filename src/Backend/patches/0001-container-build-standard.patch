@@ -637,13 +637,14 @@ new file mode 100644
 index 0000000..bc0860b
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,24 @@
 +package com.example.jwt.ops;
 +
++import org.springframework.aot.hint.MemberCategory;
 +import org.springframework.aot.hint.RuntimeHints;
 +import org.springframework.aot.hint.RuntimeHintsRegistrar;
 +
-+/** Resource bundles resolved reflectively at runtime need explicit native-image hints. */
++/** Types resolved reflectively at runtime need explicit native-image hints. */
 +public class OpsRuntimeHints implements RuntimeHintsRegistrar {
 +
 +  @Override
@@ -651,6 +652,14 @@ index 0000000..bc0860b
 +    hints.resources().registerResourceBundle("messages");
 +    hints.resources().registerResourceBundle("validationMessages");
 +    hints.reflection().registerType(java.util.UUID[].class);
++    // JWT claim serialization of granted authorities and SpEL in @PreAuthorize
++    // (authentication.principal.user, @userPermissionEvaluator) use reflection.
++    hints.reflection().registerType(org.springframework.security.core.authority.SimpleGrantedAuthority.class,
++        MemberCategory.INVOKE_PUBLIC_CONSTRUCTORS, MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(com.example.jwt.domain.user.UserDetailsImpl.class,
++        MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(com.example.jwt.core.security.permissionevaluators.UserPermissionEvaluator.class,
++        MemberCategory.INVOKE_PUBLIC_METHODS);
 +  }
 +}
 diff --git a/src/main/java/com/example/jwt/ops/ProbeCommand.java b/src/main/java/com/example/jwt/ops/ProbeCommand.java
