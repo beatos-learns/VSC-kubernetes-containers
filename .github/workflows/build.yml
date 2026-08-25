@@ -488,3 +488,134 @@ jobs:
           for t in $(version_tags "$REGISTRY/$REPO_LC/charts/generic-stack" | sort -u); do
             sign_ref "$REGISTRY/$REPO_LC/charts/generic-stack:$t" >/dev/null
           done
+
+  # ---------------------------------------------------------------------------
+  # Promotion into the Ops repo (Aufgabe 4: automated commits, never a deploy).
+  # staging: PR that merges itself once the Ops validate checks are green.
+  # prod:    PR with the same tags, merged by a human after staging is verified.
+  # Fixed branches rebuilt from the Ops main every run; identical content is
+  # not pushed twice, so a run that changed nothing causes no PR churn.
+  # ---------------------------------------------------------------------------
+  promote:
+    needs: [discover, sign]
+    if: needs.discover.outputs.publish == 'true' && !failure() && !cancelled()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    env:
+      OPS_REPO: beatos-learns/VSC-kubernetes-deployment
+      OPS_BRANCH: main
+      # fine-grained PAT scoped to the Ops repo only (README); GITHUB_TOKEN cannot cross repos
+      GH_TOKEN: ${{ secrets.OPS_REPO_TOKEN }}
+    steps:
+      - name: Require the Ops repo token
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::error::secret OPS_REPO_TOKEN is not set (fine-grained PAT for $OPS_REPO: Contents + Pull requests read/write)"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.OPS_REPO }}
+          ref: ${{ env.OPS_BRANCH }}
+          token: ${{ secrets.OPS_REPO_TOKEN }}
+          path: ops
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Promote
+        working-directory: ops
+        env:
+          ALL_IMAGES: ${{ needs.discover.outputs.all_images }}
+          CHART_VERSION: ${{ needs.discover.outputs.chart_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          STAGING=charts/auth-stack/values-staging.yaml
+          PROD=charts/auth-stack/values-prod.yaml
+          CHART=charts/auth-stack/Chart.yaml
+          LOCK=charts/auth-stack/Chart.lock
+          SOURCE="$GITHUB_REPOSITORY@${GITHUB_SHA:0:7}"
+          git checkout -q --detach "origin/$OPS_BRANCH"
+
+          tag_in() { yq -r ".generic-stack.components.[\"$2\"].image.tag // \"\"" "$1"; }
+          # edits the anchored line in place: formatting and the marker comment survive
+          set_tag() {
+            local file=$1 marker=$2 comp=$3 tag=$4
+            sed -i -E "/^    $comp:\$/,/^    [a-z]/ s|^(        tag: )\"[^\"]*\"( # $marker)\$|\1\"$tag\"\2|" "$file"
+            [ "$(tag_in "$file" "$comp")" = "$tag" ] || { echo "::error file=$file::no 'tag: ... # $marker' line under components.$comp"; exit 1; }
+          }
+          join() { local s; s=$(printf '%s, ' "$@"); printf '%s' "${s%, }"; }
+
+          # image tags: what this source tree builds, for the components the overlays manage
+          staging_changes=(); prod_changes=()
+          while IFS= read -r entry; do
+            lc=$(jq -r .lc <<< "$entry"); name=$(jq -r .name <<< "$entry"); tag=$(jq -r .tag <<< "$entry")
+            if [ -z "$(tag_in "$STAGING" "$lc")" ]; then echo "not managed by the Ops overlays: $lc ($name:$tag)"; continue; fi
+            for f in "$STAGING" "$PROD"; do
+              repo=$(yq -r ".generic-stack.components.[\"$lc\"].image.repository // \"\"" "$f")
+              [ -z "$repo" ] || [ "$repo" = "$name" ] || { echo "::error file=$f::components.$lc overrides image.repository ($repo); refusing to promote $name"; exit 1; }
+            done
+            [ "$(tag_in "$STAGING" "$lc")" = "$tag" ] || staging_changes+=("$name $tag")
+            [ "$(tag_in "$PROD" "$lc")" = "$tag" ] || prod_changes+=("$name $tag")
+            set_tag "$STAGING" "promoted by CI" "$lc" "$tag"
+            set_tag "$PROD" "promoted via PR" "$lc" "$tag"
+          done < <(jq -c '.[]' <<< "$ALL_IMAGES")
+
+          # chart pin: shared by both environments (one wrapper chart), travels with the staging PR
+          chart_files=()
+          pinned=$(yq -r '.dependencies[] | select(.name == "generic-stack") | .version' "$CHART")
+          if [ "$pinned" != "$CHART_VERSION" ]; then
+            sed -i -E "/^  - name: generic-stack\$/,/^  - name: / s|^(    version: )\"?[^\"]*\"?\$|\1\"$CHART_VERSION\"|" "$CHART"
+            [ "$(yq -r '.dependencies[] | select(.name == "generic-stack") | .version' "$CHART")" = "$CHART_VERSION" ] || { echo "::error file=$CHART::could not pin generic-stack $CHART_VERSION"; exit 1; }
+            helm dependency update charts/auth-stack
+            staging_changes+=("generic-stack chart $CHART_VERSION")
+            chart_files=("$CHART" "$LOCK")
+          fi
+
+          snap=$(mktemp -d)
+          for f in "$STAGING" "$PROD" "${chart_files[@]}"; do mkdir -p "$snap/$(dirname "$f")"; cp "$f" "$snap/$f"; done
+          git checkout -q -- .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # publish <branch> <title> <body> <automerge> <files...>: one commit on top of the Ops main
+          publish() {
+            local branch=$1 title=$2 body=$3 automerge=$4 num; shift 4
+            git checkout -q -B "$branch" "origin/$OPS_BRANCH"
+            for f in "$@"; do cp "$snap/$f" "$f"; done
+            git add -- "$@"
+            if git diff --cached --quiet; then echo "$branch: nothing to promote"; return 0; fi
+            git commit -q -m "$title"
+            if git fetch -q origin "$branch" 2>/dev/null && git diff --quiet "origin/$branch" "$branch"; then
+              echo "$branch: already up to date"
+            else
+              git push -q --force origin "$branch"
+              echo "$branch: pushed $(git rev-parse --short HEAD)"
+            fi
+            num=$(gh pr list --repo "$OPS_REPO" --head "$branch" --base "$OPS_BRANCH" --state open --json number --jq '.[0].number // empty')
+            if [ -z "$num" ]; then
+              num=$(gh pr create --repo "$OPS_REPO" --head "$branch" --base "$OPS_BRANCH" --title "$title" --body "$body" | grep -oE '[0-9]+$')
+              echo "$branch: opened PR #$num"
+            else
+              gh pr edit "$num" --repo "$OPS_REPO" --title "$title" --body "$body" >/dev/null
+              echo "$branch: refreshed PR #$num"
+            fi
+            if [ "$automerge" = true ] && [ -z "$(gh pr view "$num" --repo "$OPS_REPO" --json autoMergeRequest --jq '.autoMergeRequest.enabledAt // empty')" ]; then
+              gh pr merge "$num" --repo "$OPS_REPO" --auto --merge
+              echo "$branch: auto-merge armed (merges once the Ops validate checks are green)"
+            fi
+          }
+
+          if [ ${#staging_changes[@]} -gt 0 ]; then
+            publish promote/staging "promote(staging): $(join "${staging_changes[@]}")" \
+              "$(printf 'Promotion from %s (%s).\n\n%s\n\nMerges automatically once the validate checks are green.' \
+                 "$SOURCE" "$RUN_URL" "$(printf -- '- %s\n' "${staging_changes[@]}")")" \
+              true "$STAGING" "${chart_files[@]}"
+          else
+            echo "staging: nothing to promote"
+          fi
+          if [ ${#prod_changes[@]} -gt 0 ]; then
+            publish promote/prod "promote(prod): $(join "${prod_changes[@]}")" \
+              "$(printf 'Promotion from %s (%s).\n\n%s\n\nMerge after verifying the same tags on staging.' \
+                 "$SOURCE" "$RUN_URL" "$(printf -- '- %s\n' "${prod_changes[@]}")")" \
+              false "$PROD"
+          else
+            echo "prod: nothing to promote"
+          fi
