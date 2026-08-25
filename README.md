@@ -104,6 +104,19 @@ must supply (secrets, registry credentials, storage, exposure) is listed in the 
   older tags included) keylessly with cosign (GitHub OIDC, Rekor-logged) and attaches the
   SBOMs of freshly built images as attestations. The Ops repo's validate gate refuses
   unsigned references. Publishing and signing only happen on the default branch.
+- **promote** commits the result into the Ops repo
+  (`beatos-learns/VSC-kubernetes-deployment`) - the only way anything reaches the cluster
+  (Aufgabe 4: automated commits, no deploy step, no cluster credentials). It edits the
+  anchored `tag: "…" # promoted …` lines of the two environment overlays in place (only
+  the components the overlays manage: `db`, `backend`, `frontend`) and pins a newly
+  published chart version in `Chart.yaml`/`Chart.lock`. Branch `promote/staging` becomes a
+  PR with auto-merge armed - it merges itself once the Ops validate checks are green;
+  branch `promote/prod` becomes a PR a human merges after verifying staging. Both branches
+  are rebuilt from the Ops `main` on every run and only pushed when their content changed,
+  so a run that rebuilt nothing causes no PR churn. Requires the Actions secret
+  `OPS_REPO_TOKEN`: a fine-grained PAT scoped to **only** the Ops repo with *Contents* and
+  *Pull requests* read/write (the default `GITHUB_TOKEN` cannot cross repositories); the
+  job fails loudly when it is missing.
 
 All actions are pinned to commit SHAs and every downloaded tool is checksum-verified.
 Pull requests run everything except pushes and signing. `workflow_dispatch` with `force`
@@ -111,6 +124,7 @@ rebuilds all.
 
 **Releasing a change:** bump the tag in the component's `buildCommand` and the matching
 `components.<name>.image.tag` in the chart values (plus the chart's own `version`), push —
-CI rebuilds exactly that. Forgetting one half trips the consistency gate. Renovate proposes
+CI rebuilds exactly that, and the promote job opens the two Ops PRs. Forgetting one half
+trips the consistency gate. Renovate proposes
 base-image digest bumps and CI tool updates; upstream source bumps are manual (change the
 pinned commit and upstream version ARG in the Containerfile).
