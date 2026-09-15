@@ -14,6 +14,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY supervisor/ /src/
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/pgsupervisor .
 
 # ---------------------------------------------------------------------------
@@ -39,7 +40,7 @@ RUN mkdir -p /rootfs \
       --setopt=reposdir=/etc/yum.repos.d \
       --setopt=varsdir=/etc/dnf/vars \
       --setopt=install_weak_deps=0 \
-      install postgresql16-server-16.15-1PGDG.rhel10.2 \
+      install postgresql16-server-16.15-1PGDG.rhel10.2 tzdata \
  && rm -rf /var/cache/microdnf-rootfs /rootfs/var/cache/* /rootfs/var/lib/dnf /rootfs/usr/share/man \
       /rootfs/usr/share/doc /rootfs/usr/share/info /rootfs/usr/share/locale \
       /rootfs/etc/yum.repos.d /rootfs/tmp/*

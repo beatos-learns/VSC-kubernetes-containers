@@ -33,7 +33,6 @@ env:
   KUBECONFORM_VERSION: v0.8.0
   KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
   KUBERNETES_VERSION: "1.33.1" # keep in sync with the ops repo's validate.yml
-  CRD_SCHEMAS: 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
   COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
   # artifacts are published and signed only from the default branch (never from a dispatch on a feature branch)
   DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -391,15 +390,12 @@ jobs:
           sed -i "s|^  imageRegistry: .*|  imageRegistry: $REGISTRY/$REPO_LC|" values.yaml
           helm lint . --strict
           base=(--set components.db.secret.db-password=x --set components.backend.secret.db-password=x --set components.backend.secret.jwt-secret=x)
-          kc=(kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" -schema-location default -schema-location "$CRD_SCHEMAS")
+          kc=(kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" -schema-location default)
           helm template ci . "${base[@]}" | "${kc[@]}"
           helm template ci . "${base[@]}" \
             --set components.backend.hpa.enabled=true --set components.backend.resources.requests.cpu=100m \
             --set components.backend.pdb.enabled=true --set components.backend.pdb.maxUnavailable=1 \
             --set components.backend.antiAffinity=required \
-            | "${kc[@]}"
-          helm template ci . "${base[@]}" \
-            --set components.backend.monitoring.podMonitor.enabled=true \
             | "${kc[@]}"
           helm package . --destination dist
       - name: Push chart
@@ -490,7 +486,7 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Promotion into the Ops repo (Aufgabe 4: automated commits, never a deploy).
+  # Promotion into the Ops repo (automated commits, never a deploy).
   # staging: PR that merges itself once the Ops validate checks are green.
   # prod:    PR with the same tags, merged by a human after staging is verified.
   # Fixed branches rebuilt from the Ops main every run; identical content is

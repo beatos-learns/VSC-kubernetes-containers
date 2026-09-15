@@ -1,0 +1,21 @@
+{{/* ------------------------------------------------------------------------ */}}
+{{/* The admin and log interface of every container, configured once through the
+     chart-wide `monitoring` block and written to each component's env surface
+     (component `monitoring.*Env` names; null keeps the image default) */}}
+{{- range $name, $raw := .Values.components }}
+{{- $spec := mustMergeOverwrite (deepCopy $.Values.componentDefaults) (deepCopy $raw) }}
+{{- $env := fromYaml (include "generic-stack.monitoringEnv" (dict "root" $ "spec" $spec)) }}
+{{- if and $spec.enabled $env }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "generic-stack.componentName" (dict "root" $ "name" $name) }}-monitoring
+  labels:
+    {{- include "generic-stack.labels" (dict "root" $ "name" $name "spec" $spec) | nindent 4 }}
+data:
+{{- range $k, $v := $env }}
+  {{ $k }}: {{ toString $v | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

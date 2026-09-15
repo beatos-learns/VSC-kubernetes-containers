@@ -1,12 +1,13 @@
 // traefiksupervisor: PID 1 of the Traefik image. Checker-as-parent topology per
 // the container build standard: supervises the traefik process, serves the
-// probe endpoints and metrics on ADMIN_PORT (backed by traefik's /ping), maps
-// SIGTERM/SIGINT to the drain sequence, prepares the ACME storage file with the
-// 0600 mode traefik enforces, reaps orphans, and propagates the child's exit
-// status so a dead traefik can never hide behind a green probe.
+// probe endpoints and OpenMetrics on ADMIN_PORT (backed by traefik's /ping),
+// maps SIGTERM/SIGINT to the drain sequence, prepares the ACME storage file
+// with the 0600 mode traefik enforces, reaps orphans, and propagates the
+// child's exit status so a dead traefik can never hide behind a green probe.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,11 +16,25 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/common/expfmt"
+)
+
+const (
+	serviceName = "traefik"
+	loggerName  = "supervisor"
+	ecsVersion  = "8.11"
+	pingCheck   = "traefik-ping"
+	openMetrics = "application/openmetrics-text; version=1.0.0; charset=utf-8"
 )
 
 type config struct {
@@ -39,8 +54,10 @@ type config struct {
 }
 
 type checkResult struct {
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	OK              bool      `json:"ok"`
+	Detail          string    `json:"detail"`
+	DurationSeconds float64   `json:"durationSeconds"`
+	LastSuccess     time.Time `json:"lastSuccess"`
 }
 
 type snapshot struct {
@@ -49,32 +66,58 @@ type snapshot struct {
 }
 
 type state struct {
-	snap     atomic.Value
-	started  atomic.Bool
-	draining atomic.Bool
+	snap       atomic.Value
+	started    atomic.Bool
+	draining   atomic.Bool
+	cycles     atomic.Uint64
+	childUp    atomic.Bool
+	childStart atomic.Int64
 }
 
 var logLevels = map[string]int{"trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4}
 
+// logger writes ECS-shaped JSON (or a one-line text form) to stdout: the
+// supervisor's own lines; traefik's output passes through untouched.
 type logger struct {
-	level  int
-	format string
+	level   int
+	format  string
+	version string
+	mu      sync.Mutex
 }
 
-func (l *logger) log(level, msg string) {
+func (l *logger) log(level, msg string, fields ...any) {
 	if logLevels[level] < l.level {
 		return
 	}
+	now := time.Now().UTC()
+	var line []byte
 	if l.format == "json" {
-		entry, _ := json.Marshal(map[string]string{
-			"time": time.Now().UTC().Format(time.RFC3339), "level": level,
-			"logger": "traefiksupervisor", "msg": msg,
-		})
-		fmt.Fprintln(os.Stderr, string(entry))
+		entry := map[string]any{
+			"@timestamp":      now.Format(time.RFC3339Nano),
+			"log.level":       level,
+			"log.logger":      loggerName,
+			"message":         msg,
+			"ecs.version":     ecsVersion,
+			"service.name":    serviceName,
+			"service.version": l.version,
+		}
+		for i := 0; i+1 < len(fields); i += 2 {
+			if key, ok := fields[i].(string); ok {
+				entry[key] = fields[i+1]
+			}
+		}
+		line, _ = json.Marshal(entry)
 	} else {
-		fmt.Fprintf(os.Stderr, "%s %-5s traefiksupervisor: %s\n",
-			time.Now().UTC().Format(time.RFC3339), strings.ToUpper(level), msg)
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s %-5s %s: %s", now.Format(time.RFC3339), strings.ToUpper(level), loggerName, msg)
+		for i := 0; i+1 < len(fields); i += 2 {
+			fmt.Fprintf(&b, " %v=%v", fields[i], fields[i+1])
+		}
+		line = []byte(b.String())
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = os.Stdout.Write(append(line, '\n'))
 }
 
 func (l *logger) infof(format string, args ...any)  { l.log("info", fmt.Sprintf(format, args...)) }
@@ -82,7 +125,8 @@ func (l *logger) warnf(format string, args ...any)  { l.log("warn", fmt.Sprintf(
 func (l *logger) errorf(format string, args ...any) { l.log("error", fmt.Sprintf(format, args...)) }
 
 func fatal(msg string) {
-	fmt.Fprintln(os.Stderr, "fatal configuration error: "+msg)
+	boot := &logger{level: 0, format: "json", version: envStr("APP_VERSION", "dev")}
+	boot.log("error", "fatal configuration error: "+msg)
 	os.Exit(1)
 }
 
@@ -128,12 +172,36 @@ func envEnum(name, fallback string, allowed ...string) string {
 	return ""
 }
 
+// The supervisor's own log level and format follow traefik's unless LOG_LEVEL /
+// LOG_FORMAT are set explicitly, so one deployment-side logging block drives
+// both processes.
+func traefikLogLevel() string {
+	switch strings.ToLower(envStr("TRAEFIK_LOG_LEVEL", "info")) {
+	case "trace":
+		return "trace"
+	case "debug":
+		return "debug"
+	case "warn", "warning":
+		return "warn"
+	case "error", "fatal", "panic":
+		return "error"
+	}
+	return "info"
+}
+
+func traefikLogFormat() string {
+	if strings.EqualFold(envStr("TRAEFIK_LOG_FORMAT", "json"), "common") {
+		return "text"
+	}
+	return "json"
+}
+
 func loadConfig() *config {
 	cfg := &config{
 		adminPort:     envInt("ADMIN_PORT", 9090, 1, 65535),
 		bindAddr:      envStr("BIND_ADDR", "0.0.0.0"),
-		logLevel:      envEnum("LOG_LEVEL", "info", "trace", "debug", "info", "warn", "error"),
-		logFormat:     envEnum("LOG_FORMAT", "json", "json", "text"),
+		logLevel:      envEnum("LOG_LEVEL", traefikLogLevel(), "trace", "debug", "info", "warn", "error"),
+		logFormat:     envEnum("LOG_FORMAT", traefikLogFormat(), "json", "text"),
 		checkInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 5, 1, 3600)) * time.Second,
 		checkTimeout:  time.Duration(envInt("HEALTH_CHECK_TIMEOUT", 2, 1, 3600)) * time.Second,
 		staleFactor:   envFloat("HEALTH_STALE_FACTOR", 3, 1, 100),
@@ -164,21 +232,24 @@ func main() {
 		os.Exit(probe(os.Args[2:]))
 	}
 	cfg := loadConfig()
-	log := &logger{level: logLevels[cfg.logLevel], format: cfg.logFormat}
+	version := envStr("APP_VERSION", "dev")
+	revision := envStr("APP_REVISION", "unknown")
+	log := &logger{level: logLevels[cfg.logLevel], format: cfg.logFormat, version: version}
 	st := &state{}
-	st.snap.Store(snapshot{Results: map[string]checkResult{}})
+	st.snap.Store(snapshot{Results: map[string]checkResult{pingCheck: {Detail: "not checked yet"}}})
+
+	log.infof("traefik supervisor starting: version=%s revision=%s config[%s]", version, revision, cfg.redacted())
 
 	prepareAcmeStorage(cfg, log)
-	startAdmin(cfg, st, log)
+	startAdmin(cfg, st, log, newRegistry(st, version, revision))
 
 	childExited := make(chan int, 1)
-	child, err := startTraefik(cfg, childExited)
+	child, err := startTraefik(cfg, st, childExited)
 	if err != nil {
 		log.errorf("failed to start traefik: %v", err)
 		os.Exit(1)
 	}
-	log.infof("traefik started: version=%s revision=%s pid=%d config[%s]",
-		envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"), child.Pid, cfg.redacted())
+	log.log("info", "traefik started", "process.pid", child.Pid)
 
 	go checkerLoop(cfg, st, log)
 
@@ -241,7 +312,7 @@ func prepareAcmeStorage(cfg *config, log *logger) {
 	log.infof("pre-created ACME storage %s with mode 0600", cfg.acmeStorage)
 }
 
-func startTraefik(cfg *config, exited chan<- int) (*os.Process, error) {
+func startTraefik(cfg *config, st *state, exited chan<- int) (*os.Process, error) {
 	cmd := exec.Command(cfg.traefikBin, os.Args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -249,6 +320,8 @@ func startTraefik(cfg *config, exited chan<- int) (*os.Process, error) {
 		return nil, err
 	}
 	mainPid := cmd.Process.Pid
+	st.childStart.Store(time.Now().Unix())
+	st.childUp.Store(true)
 
 	// Sole wait4 owner: reaps traefik and any orphan reparented to PID 1.
 	go func() {
@@ -267,6 +340,7 @@ func startTraefik(cfg *config, exited chan<- int) (*os.Process, error) {
 					if status.Signaled() {
 						code = 128 + int(status.Signal())
 					}
+					st.childUp.Store(false)
 					exited <- code
 				}
 			}
@@ -280,28 +354,19 @@ func checkerLoop(cfg *config, st *state, log *logger) {
 	previous := map[string]checkResult{}
 	for {
 		cycleStart := time.Now()
-		results := map[string]checkResult{}
-		response, err := client.Get(cfg.pingURL)
-		if err != nil {
-			results["traefik-ping"] = checkResult{OK: false, Detail: err.Error()}
-		} else {
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				results["traefik-ping"] = checkResult{OK: true, Detail: "ok"}
-			} else {
-				results["traefik-ping"] = checkResult{OK: false,
-					Detail: "ping returned HTTP " + strconv.Itoa(response.StatusCode)}
-			}
+		results := map[string]checkResult{
+			pingCheck: checkPing(client, cfg.pingURL, previous[pingCheck]),
 		}
 		st.snap.Store(snapshot{Results: results, TakenAt: time.Now()})
+		st.cycles.Add(1)
 		if !st.started.Load() && allOk(results) {
 			st.started.Store(true)
 			log.infof("startup complete: first fully successful health cycle")
 		}
 		for name, result := range results {
 			if before, seen := previous[name]; seen && before.OK != result.OK {
-				log.infof("health check '%s' transitioned %v -> %v (%s)",
-					name, before.OK, result.OK, result.Detail)
+				log.log("info", fmt.Sprintf("health check '%s' transitioned %v -> %v (%s)",
+					name, before.OK, result.OK, result.Detail), "health.check", name, "health.up", result.OK)
 			}
 		}
 		previous = results
@@ -309,6 +374,28 @@ func checkerLoop(cfg *config, st *state, log *logger) {
 			time.Sleep(sleep)
 		}
 	}
+}
+
+// checkPing verifies traefik's /ping on the internal ping entrypoint; the
+// last-success timestamp survives a failing cycle.
+func checkPing(client *http.Client, url string, previous checkResult) checkResult {
+	result := checkResult{LastSuccess: previous.LastSuccess}
+	begin := time.Now()
+	response, err := client.Get(url)
+	result.DurationSeconds = time.Since(begin).Seconds()
+	if err != nil {
+		result.Detail = err.Error()
+		return result
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		result.Detail = "ping returned HTTP " + strconv.Itoa(response.StatusCode)
+		return result
+	}
+	result.OK = true
+	result.Detail = "ok"
+	result.LastSuccess = time.Now()
+	return result
 }
 
 func probeHost(addr string) string {
@@ -330,7 +417,138 @@ func allOk(results map[string]checkResult) bool {
 	return len(results) > 0
 }
 
-func startAdmin(cfg *config, st *state, log *logger) {
+// ---------------------------------------------------------------------------
+// metrics
+
+func newRegistry(st *state, version, revision string) *prometheus.Registry {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		newOpsCollector(st, version, revision),
+	)
+	return registry
+}
+
+// opsCollector renders the cached health snapshot and the supervisor state as
+// the baseline families every image of this repository serves.
+type opsCollector struct {
+	st       *state
+	version  string
+	revision string
+
+	buildInfo        *prometheus.Desc
+	checkUp          *prometheus.Desc
+	checkDuration    *prometheus.Desc
+	checkLastSuccess *prometheus.Desc
+	snapshotAge      *prometheus.Desc
+	cycles           *prometheus.Desc
+	draining         *prometheus.Desc
+	childUp          *prometheus.Desc
+	childStart       *prometheus.Desc
+}
+
+func newOpsCollector(st *state, version, revision string) *opsCollector {
+	return &opsCollector{
+		st: st, version: version, revision: revision,
+		buildInfo: prometheus.NewDesc("build_info",
+			"The running artifact; always 1.", []string{"version", "revision"}, nil),
+		checkUp: prometheus.NewDesc("health_check_up",
+			"1 when the check passed in the last checker cycle.", []string{"check"}, nil),
+		checkDuration: prometheus.NewDesc("health_check_duration_seconds",
+			"Duration of the last run of the check.", []string{"check"}, nil),
+		checkLastSuccess: prometheus.NewDesc("health_check_last_success_timestamp_seconds",
+			"Unix time of the last pass of the check; 0 until it passed once.", []string{"check"}, nil),
+		snapshotAge: prometheus.NewDesc("health_snapshot_age_seconds",
+			"Age of the cached health snapshot; 0 before the first checker cycle.", nil, nil),
+		cycles: prometheus.NewDesc("health_checker_cycles_total",
+			"Completed health checker cycles.", nil, nil),
+		draining: prometheus.NewDesc("health_draining",
+			"1 once the shutdown drain latch is set (readiness reports 503).", nil, nil),
+		childUp: prometheus.NewDesc("supervisor_child_up",
+			"1 while the supervised traefik process is running.", nil, nil),
+		childStart: prometheus.NewDesc("supervisor_child_start_time_seconds",
+			"Unix time the supervised traefik process was started; 0 before it started.", nil, nil),
+	}
+}
+
+func (c *opsCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, desc := range []*prometheus.Desc{c.buildInfo, c.checkUp, c.checkDuration, c.checkLastSuccess,
+		c.snapshotAge, c.cycles, c.draining, c.childUp, c.childStart} {
+		ch <- desc
+	}
+}
+
+func (c *opsCollector) Collect(ch chan<- prometheus.Metric) {
+	ch <- prometheus.MustNewConstMetric(c.buildInfo, prometheus.GaugeValue, 1, c.version, c.revision)
+	snap := c.st.snap.Load().(snapshot)
+	names := make([]string, 0, len(snap.Results))
+	for name := range snap.Results {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		result := snap.Results[name]
+		ch <- prometheus.MustNewConstMetric(c.checkUp, prometheus.GaugeValue, boolGauge(result.OK), name)
+		ch <- prometheus.MustNewConstMetric(c.checkDuration, prometheus.GaugeValue, result.DurationSeconds, name)
+		lastSuccess := 0.0
+		if !result.LastSuccess.IsZero() {
+			lastSuccess = float64(result.LastSuccess.UnixNano()) / 1e9
+		}
+		ch <- prometheus.MustNewConstMetric(c.checkLastSuccess, prometheus.GaugeValue, lastSuccess, name)
+	}
+	age := 0.0
+	if !snap.TakenAt.IsZero() {
+		age = time.Since(snap.TakenAt).Seconds()
+	}
+	ch <- prometheus.MustNewConstMetric(c.snapshotAge, prometheus.GaugeValue, age)
+	ch <- prometheus.MustNewConstMetric(c.cycles, prometheus.CounterValue, float64(c.st.cycles.Load()))
+	ch <- prometheus.MustNewConstMetric(c.draining, prometheus.GaugeValue, boolGauge(c.st.draining.Load()))
+	ch <- prometheus.MustNewConstMetric(c.childUp, prometheus.GaugeValue, boolGauge(c.st.childUp.Load()))
+	ch <- prometheus.MustNewConstMetric(c.childStart, prometheus.GaugeValue, float64(c.st.childStart.Load()))
+}
+
+func boolGauge(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+// metricsHandler always answers OpenMetrics (no content negotiation): the body
+// is rendered into a buffer first so a gather failure never yields a partial
+// 200, and ends with the `# EOF` terminator the encoder writes on Close.
+func metricsHandler(registry *prometheus.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		families, err := registry.Gather()
+		if err != nil {
+			http.Error(w, "metrics gather failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var body bytes.Buffer
+		encoder := expfmt.NewEncoder(&body, expfmt.NewFormat(expfmt.TypeOpenMetrics))
+		for _, family := range families {
+			if err := encoder.Encode(family); err != nil {
+				http.Error(w, "metrics encode failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if closer, ok := encoder.(expfmt.Closer); ok {
+			if err := closer.Close(); err != nil {
+				http.Error(w, "metrics encode failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", openMetrics)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body.Bytes())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// admin listener
+
+func startAdmin(cfg *config, st *state, log *logger, registry *prometheus.Registry) {
 	fresh := func() bool {
 		snap := st.snap.Load().(snapshot)
 		return !snap.TakenAt.IsZero() &&
@@ -348,8 +566,9 @@ func startAdmin(cfg *config, st *state, log *logger) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(status)
 				body, _ := json.Marshal(map[string]any{
-					"status": map[bool]string{true: "ok", false: "unavailable"}[ok],
+					"status":   map[bool]string{true: "ok", false: "unavailable"}[ok],
 					"draining": st.draining.Load(), "checks": snap.Results, "takenAt": snap.TakenAt,
+					"cycles": st.cycles.Load(), "childUp": st.childUp.Load(),
 				})
 				_, _ = w.Write(body)
 				return
@@ -366,29 +585,12 @@ func startAdmin(cfg *config, st *state, log *logger) {
 		snap := st.snap.Load().(snapshot)
 		return fresh() && allOk(snap.Results) && !st.draining.Load()
 	}))
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		snap := st.snap.Load().(snapshot)
-		var body strings.Builder
-		body.WriteString("# TYPE build_info gauge\n")
-		fmt.Fprintf(&body, "build_info{version=%q,revision=%q} 1\n",
-			envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"))
-		body.WriteString("# TYPE health_check_up gauge\n")
-		for name, result := range snap.Results {
-			up := 0
-			if result.OK {
-				up = 1
-			}
-			fmt.Fprintf(&body, "health_check_up{check=%q} %d\n", name, up)
-		}
-		body.WriteString("# EOF\n")
-		w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
-		_, _ = w.Write([]byte(body.String()))
-	})
+	mux.Handle("/metrics", metricsHandler(registry))
 	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.bindAddr, strconv.Itoa(cfg.adminPort)))
 	if err != nil {
 		fatal("cannot bind admin listener: " + err.Error())
 	}
-	server := &http.Server{Handler: mux}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.errorf("admin server failed: %v", err)

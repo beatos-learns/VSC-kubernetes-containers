@@ -31,10 +31,12 @@ spec:
       protocol: TCP
     {{- end }}
     {{- range $spec.ports.extra }}
+    {{- if or (not (hasKey . "exposed")) .exposed }}
     - name: {{ .name }}
       port: {{ .servicePort | default .containerPort }}
       targetPort: {{ .name }}
       protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
     {{- end }}
 {{- end }}
 {{/* The headless Service is a StatefulSet requirement (serviceName), not optional */}}

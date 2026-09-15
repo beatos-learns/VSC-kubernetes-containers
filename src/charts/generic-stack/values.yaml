@@ -5,10 +5,37 @@ global:
   imageRegistry: ghcr.io/beatos-learns/vsc-kubernetes-containers
   imagePullSecrets: []
   storageClass: ""
+  # one pre-created Secret every component falls back to when its own
+  # existingSecret is unset (db and backend share the db-password key)
+  existingSecret: ""
 
 nameOverride: ""
 commonLabels: {}
 extraObjects: []
+
+# ---------------------------------------------------------------------------
+# Monitoring: the admin and log interface every image ships, configured once
+# for all components (templates/monitoring.yaml writes it to each component's
+# env surface; null keeps the image default; a component's `env` wins)
+# ---------------------------------------------------------------------------
+monitoring:
+  # health checker behind /startupz /livez /readyz and the health_* metrics
+  healthCheck:
+    interval: null      # seconds between checker cycles
+    timeout: null       # seconds per check, must stay below the interval
+    staleFactor: null   # snapshot older than factor x interval flips /livez
+  # drain sequence on SIGTERM/SIGINT; the pod's terminationGracePeriodSeconds
+  # is derived from it (delay + timeout + the image's escalation window + margin)
+  shutdown:
+    drainDelay: null    # seconds of not-ready before intake stops
+    timeout: null       # seconds granted to in-flight work
+    margin: 5           # seconds of grace period beyond what the image needs
+  logging:
+    level: info
+    format: json
+    # true/false switches the access log of every HTTP component; null keeps
+    # each image's own default (frontend on, backend off, proxy off)
+    access: null
 
 # ---------------------------------------------------------------------------
 # Component defaults (deep-merged under every component)
@@ -37,6 +64,8 @@ componentDefaults:
   security:
     uid: null
     gid: null
+  # containerPorts are also written to the container's env (monitoring.portEnv /
+  # adminPortEnv, an extra port's own `env`), so image and pod always agree
   ports:
     main:
       name: http
@@ -77,30 +106,50 @@ componentDefaults:
     annotations: {}
     hosts: []
     tls: []
+  # periodSeconds null = derived from the effective health checker: startup and
+  # readiness probe once per checker cycle, liveness once per staleness window
+  # (staleFactor x interval, the moment the image itself reports not alive)
   probes:
     startup:
       enabled: true
       path: /startupz
-      periodSeconds: 5
+      periodSeconds: null
       failureThreshold: 36
       timeoutSeconds: 2
     liveness:
       enabled: true
       path: /livez
-      periodSeconds: 10
+      periodSeconds: null
       failureThreshold: 3
       timeoutSeconds: 2
     readiness:
       enabled: true
       path: /readyz
-      periodSeconds: 5
+      periodSeconds: null
       failureThreshold: 2
       timeoutSeconds: 2
+  # the image's admin/log interface as the chart-wide `monitoring` block sees it:
+  # the env names it writes to, and the image's own health-check and shutdown
+  # defaults (from its CONTRACT.md) that apply while the chart-wide value is null
   monitoring:
-    podMonitor:
-      enabled: false
-      interval: 30s
-      labels: {}
+    portEnv: PORT
+    adminPortEnv: ADMIN_PORT
+    portFormat: "%d"
+    levelEnv: LOG_LEVEL
+    formatEnv: LOG_FORMAT
+    accessEnv: ACCESS_LOG
+    upperCaseLevel: false
+    formatValues:
+      json: json
+      text: text
+    healthCheck:
+      interval: 5
+      timeout: 2
+      staleFactor: 3
+    shutdown:
+      drainDelay: 3
+      timeout: 10
+      escalation: 0     # seconds the image spends escalating after the budget
   resources: {}
   # Deployment: verbatim `strategy`; unset = RollingUpdate maxUnavailable 0 /
   # maxSurge 1 (Recreate when persistence is enabled). StatefulSet: updateStrategy.
@@ -111,7 +160,9 @@ componentDefaults:
   antiAffinity: preferred
   topologySpreadConstraints: []
   priorityClassName: ""
-  terminationGracePeriodSeconds: 30
+  # null = drainDelay + timeout + escalation + monitoring.shutdown.margin; an
+  # explicit value must still cover delay + timeout + escalation
+  terminationGracePeriodSeconds: null
   automountServiceAccountToken: false
   podSecurityContext: {}
   containerSecurityContext: {}
@@ -134,7 +185,7 @@ components:
     kind: StatefulSet
     image:
       repository: postgresql
-      tag: "0.0.1"
+      tag: "0.0.2"
     security:
       uid: 10020
       gid: 10020
@@ -158,12 +209,18 @@ components:
     probes:
       startup:
         failureThreshold: 60
-    terminationGracePeriodSeconds: 45
+    monitoring:
+      healthCheck:
+        timeout: 3
+      shutdown:
+        drainDelay: 0
+        timeout: 30
+        escalation: 5
 
   backend:
     image:
       repository: user-mgmt-service
-      tag: "0.0.2"
+      tag: "0.0.3"
     security:
       uid: 10021
       gid: 10021
@@ -182,12 +239,11 @@ components:
     secretEnv:
       SPRING_DATASOURCE_PASSWORD: db-password
       JWT_SECRET: jwt-secret
-    terminationGracePeriodSeconds: 20
 
   frontend:
     image:
       repository: auth-portal
-      tag: "0.0.1"
+      tag: "0.0.2"
     security:
       uid: 10022
       gid: 10022
@@ -199,12 +255,11 @@ components:
         protocol: TCP
     env:
       API_URL: 'http://{{ include "generic-stack.componentName" (dict "root" . "name" "backend") }}:{{ .Values.components.backend.ports.main.servicePort }}'
-    terminationGracePeriodSeconds: 20
 
   proxy:
     image:
       repository: traefik
-      tag: "0.0.2"
+      tag: "0.0.3"
     security:
       uid: 10023
       gid: 10023
@@ -219,6 +274,26 @@ components:
           containerPort: 8443
           servicePort: 443
           protocol: TCP
+          env: TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS
+        # Traefik's own metrics endpoint: container-only, never published on
+        # the LoadBalancer Service
+        - name: metrics
+          containerPort: 9101
+          exposed: false
+          env: TRAEFIK_ENTRYPOINTS_METRICS_ADDRESS
+    monitoring:
+      # Traefik takes its listeners as entrypoint addresses (":port")
+      portEnv: TRAEFIK_ENTRYPOINTS_WEB_ADDRESS
+      portFormat: ":%d"
+      levelEnv: TRAEFIK_LOG_LEVEL
+      formatEnv: TRAEFIK_LOG_FORMAT
+      accessEnv: TRAEFIK_ACCESSLOG
+      upperCaseLevel: true
+      formatValues:
+        json: json
+        text: common
+      shutdown:
+        timeout: 15
     files:
       routes.yaml: |
         http:
@@ -239,4 +314,3 @@ components:
       mountPath: /data
     service:
       type: LoadBalancer
-    terminationGracePeriodSeconds: 25

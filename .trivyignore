@@ -1,17 +1,14 @@
 # Trivy gate exceptions (HIGH+CRITICAL gate in .github/workflows/build.yml).
 # Every entry expires; renew only with a reason and an owner.
 
-# user-mgmt-service arm64: runtime quay.io/almalinuxorg/10-micro:10.2 still ships
-# libacl 2.3.2-4.el10; the fix 2.4.0-1.el10_2 is in the AlmaLinux 10 repo but no
-# rebuilt 10-micro image is published yet. Permanent fix: assemble the arm64
-# runtime rootfs with `microdnf --installroot` (like src/DB) or re-pin 10-micro
-# once its digest moves.
+# user-mgmt-service arm64: the pinned runtime base quay.io/almalinuxorg/10-micro:10.2
+# ships libacl 2.3.2-4.el10 (2.4.0-1.el10_2 is in the AlmaLinux 10 repo, but the
+# runtime stage installs nothing and no rebuilt 10-micro digest is published).
 CVE-2026-54369 exp:2026-10-31
 CVE-2026-54370 exp:2026-10-31
 
-# auth-portal:0.0.1-node (alternative Node.js variant, not deployed by the Ops
+# auth-portal:0.0.2-node (alternative Node.js variant, not deployed by the Ops
 # repo): next 16.2.4 + sharp 0.34.5 from the pinned upstream lockfile.
-# Permanent fix: patch package.json/pnpm-lock.yaml to next 16.3.2 (sharp ^0.35.3).
 CVE-2026-44573 exp:2026-10-31
 CVE-2026-44574 exp:2026-10-31
 CVE-2026-44575 exp:2026-10-31

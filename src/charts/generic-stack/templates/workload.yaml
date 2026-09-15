@@ -7,6 +7,10 @@
 {{- $gid := required (printf "components.%s.security.gid is required" $name) $spec.security.gid }}
 {{- $secretName := include "generic-stack.secretName" (dict "root" $ "name" $name "spec" $spec) }}
 {{- $hasFiles := and $spec.files $spec.filesMountPath }}
+{{- $monitoring := fromYaml (include "generic-stack.monitoringEnv" (dict "root" $ "spec" $spec)) }}
+{{- $effective := fromYaml (include "generic-stack.effectiveMonitoring" (dict "root" $ "spec" $spec)) }}
+{{- $cyclePeriod := int $effective.interval }}
+{{- $stalePeriod := int (ceil (mulf (float64 $effective.interval) (float64 $effective.staleFactor))) }}
 {{- $selector := include "generic-stack.selectorLabels" (dict "root" $ "name" $name) }}
 ---
 apiVersion: apps/v1
@@ -48,6 +52,9 @@ spec:
     metadata:
       labels:
         {{- $selector | nindent 8 }}
+        {{- with $spec.image.tag }}
+        app.kubernetes.io/version: {{ . | quote }}
+        {{- end }}
         {{- with $spec.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -58,7 +65,7 @@ spec:
         {{- end }}
     spec:
       automountServiceAccountToken: {{ $spec.automountServiceAccountToken }}
-      terminationGracePeriodSeconds: {{ $spec.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ include "generic-stack.gracePeriod" (dict "root" $ "name" $name "spec" $spec) }}
       {{- with $spec.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -126,10 +133,16 @@ spec:
               containerPort: {{ .containerPort }}
               protocol: {{ .protocol | default "TCP" }}
             {{- end }}
-          {{- if $spec.env }}
+          {{- if or $monitoring $spec.env }}
           envFrom:
+            {{- if $monitoring }}
+            - configMapRef:
+                name: {{ $fullname }}-monitoring
+            {{- end }}
+            {{- if $spec.env }}
             - configMapRef:
                 name: {{ $fullname }}-env
+            {{- end }}
           {{- end }}
           {{- if $spec.secretEnv }}
           env:
@@ -143,15 +156,15 @@ spec:
           {{- end }}
           {{- if $spec.probes.startup.enabled }}
           startupProbe:
-            {{- include "generic-stack.probe" (dict "path" "/startupz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.startup) | nindent 12 }}
+            {{- include "generic-stack.probe" (dict "path" "/startupz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.startup "period" $cyclePeriod) | nindent 12 }}
           {{- end }}
           {{- if $spec.probes.liveness.enabled }}
           livenessProbe:
-            {{- include "generic-stack.probe" (dict "path" "/livez" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.liveness) | nindent 12 }}
+            {{- include "generic-stack.probe" (dict "path" "/livez" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.liveness "period" $stalePeriod) | nindent 12 }}
           {{- end }}
           {{- if $spec.probes.readiness.enabled }}
           readinessProbe:
-            {{- include "generic-stack.probe" (dict "path" "/readyz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.readiness) | nindent 12 }}
+            {{- include "generic-stack.probe" (dict "path" "/readyz" "port" $spec.ports.admin.containerPort "cfg" $spec.probes.readiness "period" $cyclePeriod) | nindent 12 }}
           {{- end }}
           {{- with $spec.resources }}
           resources:

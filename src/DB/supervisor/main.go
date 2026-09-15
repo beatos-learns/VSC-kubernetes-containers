@@ -1,6 +1,7 @@
 // pgsupervisor: PID 1 of the PostgreSQL image. Checker-as-parent topology per
 // the container build standard: supervises the postmaster, serves the probe
-// endpoints and metrics on ADMIN_PORT, runs initdb on an empty PGDATA, maps
+// endpoints and metrics on ADMIN_PORT, samples the database statistics over
+// the health-check connection, runs initdb on an empty PGDATA, maps
 // SIGTERM/SIGINT to the drain sequence, reaps orphans, and propagates the
 // child's exit status so a dead postmaster can never hide behind a green probe.
 package main
@@ -9,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -38,18 +38,22 @@ type config struct {
 	drainDelay    time.Duration
 	drainBudget   time.Duration
 
-	pgData        string
-	pgBinDir      string
-	pgUser        string
-	pgDatabase    string
-	pgPassword    string
-	pgExtraArgs   []string
-	initScriptDir string
+	pgData           string
+	pgBinDir         string
+	pgUser           string
+	pgDatabase       string
+	pgPassword       string
+	pgExtraArgs      []string
+	initScriptDir    string
+	logMinDurationMs int
+	logConnections   bool
 }
 
 type checkResult struct {
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	OK          bool          `json:"ok"`
+	Detail      string        `json:"detail"`
+	Duration    time.Duration `json:"durationNanos"`
+	LastSuccess time.Time     `json:"lastSuccess"`
 }
 
 type snapshot struct {
@@ -58,41 +62,22 @@ type snapshot struct {
 }
 
 type state struct {
-	snap     atomic.Value
-	started  atomic.Bool
-	draining atomic.Bool
+	snap       atomic.Value // snapshot
+	stats      atomic.Value // pgStats
+	started    atomic.Bool
+	draining   atomic.Bool
+	cycles     atomic.Uint64
+	childUp    atomic.Bool
+	childStart atomic.Int64
 }
 
-var logLevels = map[string]int{"trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4}
-
-type logger struct {
-	level  int
-	format string
-}
-
-func (l *logger) log(level, msg string) {
-	if logLevels[level] < l.level {
-		return
-	}
-	if l.format == "json" {
-		entry, _ := json.Marshal(map[string]string{
-			"time": time.Now().UTC().Format(time.RFC3339), "level": level,
-			"logger": "pgsupervisor", "msg": msg,
-		})
-		fmt.Fprintln(os.Stderr, string(entry))
-	} else {
-		fmt.Fprintf(os.Stderr, "%s %-5s pgsupervisor: %s\n",
-			time.Now().UTC().Format(time.RFC3339), strings.ToUpper(level), msg)
-	}
-}
-
-func (l *logger) infof(format string, args ...any)  { l.log("info", fmt.Sprintf(format, args...)) }
-func (l *logger) warnf(format string, args ...any)  { l.log("warn", fmt.Sprintf(format, args...)) }
-func (l *logger) errorf(format string, args ...any) { l.log("error", fmt.Sprintf(format, args...)) }
-
-func fatal(msg string) {
-	fmt.Fprintln(os.Stderr, "fatal configuration error: "+msg)
-	os.Exit(1)
+func newState() *state {
+	st := &state{}
+	st.snap.Store(snapshot{Results: map[string]checkResult{
+		"postgresql": {OK: false, Detail: "not checked yet"},
+	}})
+	st.stats.Store(pgStats{Detail: "not sampled yet"})
+	return st
 }
 
 func envStr(name, fallback string) string {
@@ -137,23 +122,37 @@ func envEnum(name, fallback string, allowed ...string) string {
 	return ""
 }
 
+func envBool(name string, fallback bool) bool {
+	raw := strings.ToLower(envStr(name, strconv.FormatBool(fallback)))
+	switch raw {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	}
+	fatal(name + "=" + raw + " is not a boolean")
+	return false
+}
+
 func loadConfig() *config {
 	cfg := &config{
-		port:          envInt("PORT", 5432, 1, 65535),
-		adminPort:     envInt("ADMIN_PORT", 9090, 1, 65535),
-		bindAddr:      envStr("BIND_ADDR", "0.0.0.0"),
-		logLevel:      envEnum("LOG_LEVEL", "info", "trace", "debug", "info", "warn", "error"),
-		logFormat:     envEnum("LOG_FORMAT", "json", "json", "text"),
-		checkInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 5, 1, 3600)) * time.Second,
-		checkTimeout:  time.Duration(envInt("HEALTH_CHECK_TIMEOUT", 3, 1, 3600)) * time.Second,
-		staleFactor:   envFloat("HEALTH_STALE_FACTOR", 3, 1, 100),
-		drainDelay:    time.Duration(envInt("SHUTDOWN_DRAIN_DELAY", 0, 0, 600)) * time.Second,
-		drainBudget:   time.Duration(envInt("SHUTDOWN_TIMEOUT", 30, 1, 3600)) * time.Second,
-		pgData:        envStr("PGDATA", "/var/lib/postgresql/data"),
-		pgBinDir:      envStr("PG_BINDIR", "/usr/pgsql-16/bin"),
-		pgUser:        envStr("POSTGRES_USER", "postgres"),
-		pgDatabase:    envStr("POSTGRES_DB", ""),
-		initScriptDir: envStr("INITDB_SCRIPT_DIR", "/docker-entrypoint-initdb.d"),
+		port:             envInt("PORT", 5432, 1, 65535),
+		adminPort:        envInt("ADMIN_PORT", 9090, 1, 65535),
+		bindAddr:         envStr("BIND_ADDR", "0.0.0.0"),
+		logLevel:         envEnum("LOG_LEVEL", "info", "trace", "debug", "info", "warn", "error"),
+		logFormat:        envEnum("LOG_FORMAT", "json", "json", "text"),
+		checkInterval:    time.Duration(envInt("HEALTH_CHECK_INTERVAL", 5, 1, 3600)) * time.Second,
+		checkTimeout:     time.Duration(envInt("HEALTH_CHECK_TIMEOUT", 3, 1, 3600)) * time.Second,
+		staleFactor:      envFloat("HEALTH_STALE_FACTOR", 3, 1, 100),
+		drainDelay:       time.Duration(envInt("SHUTDOWN_DRAIN_DELAY", 0, 0, 600)) * time.Second,
+		drainBudget:      time.Duration(envInt("SHUTDOWN_TIMEOUT", 30, 1, 3600)) * time.Second,
+		pgData:           envStr("PGDATA", "/var/lib/postgresql/data"),
+		pgBinDir:         envStr("PG_BINDIR", "/usr/pgsql-16/bin"),
+		pgUser:           envStr("POSTGRES_USER", "postgres"),
+		pgDatabase:       envStr("POSTGRES_DB", ""),
+		initScriptDir:    envStr("INITDB_SCRIPT_DIR", "/docker-entrypoint-initdb.d"),
+		logMinDurationMs: envInt("LOG_MIN_DURATION_MS", -1, -1, 2147483647),
+		logConnections:   envBool("LOG_CONNECTIONS", false),
 	}
 	if cfg.checkTimeout >= cfg.checkInterval {
 		fatal(fmt.Sprintf("HEALTH_CHECK_TIMEOUT (%v) must be smaller than HEALTH_CHECK_INTERVAL (%v)",
@@ -181,10 +180,10 @@ func (c *config) redacted() string {
 	return fmt.Sprintf("PORT=%d ADMIN_PORT=%d BIND_ADDR=%s LOG_LEVEL=%s LOG_FORMAT=%s "+
 		"HEALTH_CHECK_INTERVAL=%v HEALTH_CHECK_TIMEOUT=%v HEALTH_STALE_FACTOR=%v "+
 		"SHUTDOWN_DRAIN_DELAY=%v SHUTDOWN_TIMEOUT=%v PGDATA=%s POSTGRES_USER=%s POSTGRES_DB=%s "+
-		"POSTGRES_PASSWORD=<redacted>",
+		"POSTGRES_PASSWORD=<redacted> LOG_MIN_DURATION_MS=%d LOG_CONNECTIONS=%v",
 		c.port, c.adminPort, c.bindAddr, c.logLevel, c.logFormat,
 		c.checkInterval, c.checkTimeout, c.staleFactor, c.drainDelay, c.drainBudget,
-		c.pgData, c.pgUser, c.pgDatabase)
+		c.pgData, c.pgUser, c.pgDatabase, c.logMinDurationMs, c.logConnections)
 }
 
 func main() {
@@ -192,9 +191,8 @@ func main() {
 		os.Exit(probe(os.Args[2:]))
 	}
 	cfg := loadConfig()
-	log := &logger{level: logLevels[cfg.logLevel], format: cfg.logFormat}
-	st := &state{}
-	st.snap.Store(snapshot{Results: map[string]checkResult{}})
+	log := newLogger(cfg.logLevel, cfg.logFormat)
+	st := newState()
 
 	startAdmin(cfg, st, log)
 
@@ -206,7 +204,7 @@ func main() {
 		signal.Notify(initSignals, syscall.SIGTERM, syscall.SIGINT)
 		go func() {
 			if _, open := <-initSignals; open {
-				log.warnf("shutdown signal during first initialization: wiping partial PGDATA")
+				log.warn("shutdown signal during first initialization: wiping partial PGDATA")
 				wipePgData(cfg)
 				os.Exit(130)
 			}
@@ -234,13 +232,17 @@ func main() {
 	}
 
 	childExited := make(chan int, 1)
-	child, err := startPostgres(cfg, log, childExited)
+	child, err := startPostgres(cfg, st, childExited)
 	if err != nil {
 		log.errorf("failed to start postgres: %v", err)
 		os.Exit(1)
 	}
-	log.infof("postgresql started: version=%s revision=%s pid=%d config[%s]",
-		envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"), child.Pid, cfg.redacted())
+	log.info(fmt.Sprintf("postgresql started: version=%s revision=%s pid=%d config[%s]",
+		envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"), child.Pid, cfg.redacted()),
+		"process.pid", child.Pid)
+	if cfg.pgPassword == "" {
+		log.warn("database statistics are not sampled: POSTGRES_PASSWORD_FILE / POSTGRES_PASSWORD is not set, /metrics serves pg_up only")
+	}
 
 	go checkerLoop(cfg, st, log)
 
@@ -283,7 +285,7 @@ func main() {
 
 func needsInit(cfg *config, log *logger) bool {
 	if _, err := os.Stat(filepath.Join(cfg.pgData, initMarker)); err == nil {
-		log.warnf("previous initialization was interrupted: wiping PGDATA and reinitializing")
+		log.warn("previous initialization was interrupted: wiping PGDATA and reinitializing")
 		wipePgData(cfg)
 		return true
 	}
@@ -337,7 +339,7 @@ func initHeartbeat(cfg *config, st *state, done <-chan struct{}) {
 }
 
 func runInitdb(cfg *config, log *logger) error {
-	log.infof("empty PGDATA: running initdb")
+	log.info("empty PGDATA: running initdb")
 	pwFile, err := os.CreateTemp("/tmp", "pgpw")
 	if err != nil {
 		return err
@@ -448,23 +450,46 @@ func runInitScripts(cfg *config, log *logger) error {
 	return nil
 }
 
-func startPostgres(cfg *config, log *logger, exited chan<- int) (*os.Process, error) {
+func onOff(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
+}
+
+// postgresArgs are the baked server settings; POSTGRES_EXTRA_ARGS follows and
+// overrides any of them (the last -c wins).
+func postgresArgs(cfg *config) []string {
 	args := []string{
 		"-D", cfg.pgData,
 		"-c", "listen_addresses=" + cfg.bindAddr,
 		"-c", "port=" + strconv.Itoa(cfg.port),
 		"-c", "unix_socket_directories=/tmp",
 		"-c", "log_destination=stderr",
+		"-c", "logging_collector=off",
+		"-c", "log_line_prefix=%m [%p] %q%u@%d %a %r ",
+		"-c", "log_checkpoints=on",
+		"-c", "log_lock_waits=on",
+		"-c", "log_temp_files=0",
+		"-c", "log_autovacuum_min_duration=0",
+		"-c", "log_min_duration_statement=" + strconv.Itoa(cfg.logMinDurationMs),
+		"-c", "log_connections=" + onOff(cfg.logConnections),
+		"-c", "log_disconnections=" + onOff(cfg.logConnections),
 	}
 	args = append(args, cfg.pgExtraArgs...)
-	args = append(args, os.Args[1:]...)
-	cmd := exec.Command(filepath.Join(cfg.pgBinDir, "postgres"), args...)
+	return append(args, os.Args[1:]...)
+}
+
+func startPostgres(cfg *config, st *state, exited chan<- int) (*os.Process, error) {
+	cmd := exec.Command(filepath.Join(cfg.pgBinDir, "postgres"), postgresArgs(cfg)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	mainPid := cmd.Process.Pid
+	st.childStart.Store(time.Now().Unix())
+	st.childUp.Store(true)
 
 	// Sole wait4 owner: reaps the postmaster and any orphan reparented to PID 1.
 	go func() {
@@ -483,6 +508,7 @@ func startPostgres(cfg *config, log *logger, exited chan<- int) (*os.Process, er
 					if status.Signaled() {
 						code = 128 + int(status.Signal())
 					}
+					st.childUp.Store(false)
 					exited <- code
 				}
 			}
@@ -491,66 +517,68 @@ func startPostgres(cfg *config, log *logger, exited chan<- int) (*os.Process, er
 	return cmd.Process, nil
 }
 
+// checkerLoop is the single owner of the real check: one wire-protocol
+// connection per cycle. Reaching the authentication request is the
+// readiness signal (stored immediately); with the password at hand the same
+// connection then authenticates and samples the statistics, still within
+// HEALTH_CHECK_TIMEOUT of the dial.
 func checkerLoop(cfg *config, st *state, log *logger) {
 	host := probeHost(cfg.bindAddr)
 	previous := map[string]checkResult{}
+	var sampledOK *bool // nil until the first sampling behind a successful handshake
 	for {
 		cycleStart := time.Now()
-		results := map[string]checkResult{}
-		if err := checkPostgres(host, cfg.port, cfg.pgUser, cfg.checkTimeout); err == nil {
-			results["postgresql"] = checkResult{OK: true, Detail: "ok"}
+		last := st.snap.Load().(snapshot).Results["postgresql"]
+		conn, err := pgDial(host, cfg.port, cfg.pgUser, cfg.checkTimeout)
+		result := checkResult{Duration: time.Since(cycleStart), LastSuccess: last.LastSuccess}
+		if err == nil {
+			result.OK, result.Detail, result.LastSuccess = true, "ok", time.Now()
 		} else {
-			results["postgresql"] = checkResult{OK: false, Detail: err.Error()}
+			result.Detail = err.Error()
 		}
+		results := map[string]checkResult{"postgresql": result}
 		st.snap.Store(snapshot{Results: results, TakenAt: time.Now()})
+		st.cycles.Add(1)
 		if !st.started.Load() && allOk(results) {
 			st.started.Store(true)
-			log.infof("startup complete: first fully successful health cycle")
+			log.info("startup complete: first fully successful health cycle")
 		}
-		for name, result := range results {
-			if before, seen := previous[name]; seen && before.OK != result.OK {
-				log.infof("health check '%s' transitioned %v -> %v (%s)",
-					name, before.OK, result.OK, result.Detail)
+		for name, current := range results {
+			if before, seen := previous[name]; seen && before.OK != current.OK {
+				log.info(fmt.Sprintf("health check '%s' transitioned %v -> %v (%s)",
+					name, before.OK, current.OK, current.Detail),
+					"health.check", name, "health.up", current.OK)
 			}
 		}
 		previous = results
+
+		if conn != nil {
+			if cfg.pgPassword != "" {
+				stats := samplePgStats(conn, cfg.pgPassword, st.stats.Load().(pgStats))
+				st.stats.Store(stats)
+				if sampledOK == nil || *sampledOK != stats.OK {
+					if stats.OK {
+						log.info(fmt.Sprintf("database statistics sampling active as %s (%d databases)",
+							cfg.pgUser, len(stats.Databases)), "pg.stats.up", true)
+					} else {
+						log.warn("database statistics sampling failed: "+stats.Detail, "pg.stats.up", false)
+					}
+				}
+				ok := stats.OK
+				sampledOK = &ok
+			} else {
+				conn.close()
+			}
+		} else if cfg.pgPassword != "" {
+			lastStats := st.stats.Load().(pgStats)
+			st.stats.Store(pgStats{Detail: "handshake failed: " + err.Error(), TakenAt: time.Now(),
+				LastSuccess: lastStats.LastSuccess})
+		}
+
 		if sleep := cfg.checkInterval - time.Since(cycleStart); sleep > 0 {
 			time.Sleep(sleep)
 		}
 	}
-}
-
-// checkPostgres performs the pg_isready handshake in-process — no child
-// process, so the PID-1 reaper stays the sole wait4 owner: send a v3
-// StartupMessage, expect an authentication request ('R') back; anything else
-// (e.g. ErrorResponse while the server is starting or shutting down) fails.
-func checkPostgres(host string, port int, user string, timeout time.Duration) error {
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	payload := []byte{0, 3, 0, 0}
-	payload = append(payload, []byte("user\x00")...)
-	payload = append(payload, []byte(user)...)
-	payload = append(payload, 0)
-	payload = append(payload, []byte("database\x00postgres\x00\x00")...)
-	length := uint32(len(payload) + 4)
-	message := []byte{byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length)}
-	message = append(message, payload...)
-	if _, err := conn.Write(message); err != nil {
-		return err
-	}
-	kind := make([]byte, 1)
-	if _, err := io.ReadFull(conn, kind); err != nil {
-		return err
-	}
-	if kind[0] != 'R' {
-		return fmt.Errorf("postgres not accepting connections (response %q)", kind[0])
-	}
-	return nil
 }
 
 func probeHost(addr string) string {
@@ -590,7 +618,7 @@ func startAdmin(cfg *config, st *state, log *logger) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(status)
 				body, _ := json.Marshal(map[string]any{
-					"status": map[bool]string{true: "ok", false: "unavailable"}[ok],
+					"status":   map[bool]string{true: "ok", false: "unavailable"}[ok],
 					"draining": st.draining.Load(), "checks": snap.Results, "takenAt": snap.TakenAt,
 				})
 				_, _ = w.Write(body)
@@ -608,29 +636,12 @@ func startAdmin(cfg *config, st *state, log *logger) {
 		snap := st.snap.Load().(snapshot)
 		return fresh() && allOk(snap.Results) && !st.draining.Load()
 	}))
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		snap := st.snap.Load().(snapshot)
-		var body strings.Builder
-		body.WriteString("# TYPE build_info gauge\n")
-		fmt.Fprintf(&body, "build_info{version=%q,revision=%q} 1\n",
-			envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"))
-		body.WriteString("# TYPE health_check_up gauge\n")
-		for name, result := range snap.Results {
-			up := 0
-			if result.OK {
-				up = 1
-			}
-			fmt.Fprintf(&body, "health_check_up{check=%q} %d\n", name, up)
-		}
-		body.WriteString("# EOF\n")
-		w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
-		_, _ = w.Write([]byte(body.String()))
-	})
+	mux.HandleFunc("/metrics", metricsHandler(newRegistry(st)))
 	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.bindAddr, strconv.Itoa(cfg.adminPort)))
 	if err != nil {
 		fatal("cannot bind admin listener: " + err.Error())
 	}
-	server := &http.Server{Handler: mux}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.errorf("admin server failed: %v", err)

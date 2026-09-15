@@ -3,24 +3,19 @@
 // proxying with the httpOnly jwt cookie) plus the auth redirects that upstream
 // implemented as Next middleware. In-process checker topology per the container
 // build standard: probe endpoints, cached health checker, signal-driven drain,
-// and the exec-style probe subcommand all live in this single static binary.
+// the exec-style probe subcommand, the metrics contract of the stack and the
+// ECS access log all live in this single static binary.
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -31,6 +26,7 @@ type config struct {
 	bindAddr      string
 	logLevel      string
 	logFormat     string
+	accessLog     bool
 	checkInterval time.Duration
 	checkTimeout  time.Duration
 	staleFactor   float64
@@ -43,49 +39,6 @@ type config struct {
 	cookieMaxAge int
 	staticDir    string
 }
-
-type checkResult struct {
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
-}
-
-type snapshot struct {
-	Results map[string]checkResult `json:"checks"`
-	TakenAt time.Time              `json:"takenAt"`
-}
-
-type state struct {
-	snap     atomic.Value
-	started  atomic.Bool
-	draining atomic.Bool
-}
-
-var logLevels = map[string]int{"trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4}
-
-type logger struct {
-	level  int
-	format string
-}
-
-func (l *logger) log(level, msg string) {
-	if logLevels[level] < l.level {
-		return
-	}
-	if l.format == "json" {
-		entry, _ := json.Marshal(map[string]string{
-			"time": time.Now().UTC().Format(time.RFC3339), "level": level,
-			"logger": "auth-portal-server", "msg": msg,
-		})
-		fmt.Fprintln(os.Stderr, string(entry))
-	} else {
-		fmt.Fprintf(os.Stderr, "%s %-5s auth-portal-server: %s\n",
-			time.Now().UTC().Format(time.RFC3339), strings.ToUpper(level), msg)
-	}
-}
-
-func (l *logger) infof(format string, args ...any)  { l.log("info", fmt.Sprintf(format, args...)) }
-func (l *logger) warnf(format string, args ...any)  { l.log("warn", fmt.Sprintf(format, args...)) }
-func (l *logger) errorf(format string, args ...any) { l.log("error", fmt.Sprintf(format, args...)) }
 
 func fatal(msg string) {
 	fmt.Fprintln(os.Stderr, "fatal configuration error: "+msg)
@@ -153,6 +106,7 @@ func loadConfig() *config {
 		bindAddr:      envStr("BIND_ADDR", "0.0.0.0"),
 		logLevel:      envEnum("LOG_LEVEL", "info", "trace", "debug", "info", "warn", "error"),
 		logFormat:     envEnum("LOG_FORMAT", "json", "json", "text"),
+		accessLog:     envBool("ACCESS_LOG", true),
 		checkInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 5, 1, 3600)) * time.Second,
 		checkTimeout:  time.Duration(envInt("HEALTH_CHECK_TIMEOUT", 2, 1, 3600)) * time.Second,
 		staleFactor:   envFloat("HEALTH_STALE_FACTOR", 3, 1, 100),
@@ -185,11 +139,11 @@ func loadConfig() *config {
 }
 
 func (c *config) redacted() string {
-	return fmt.Sprintf("PORT=%d ADMIN_PORT=%d BIND_ADDR=%s LOG_LEVEL=%s LOG_FORMAT=%s "+
+	return fmt.Sprintf("PORT=%d ADMIN_PORT=%d BIND_ADDR=%s LOG_LEVEL=%s LOG_FORMAT=%s ACCESS_LOG=%v "+
 		"HEALTH_CHECK_INTERVAL=%v HEALTH_CHECK_TIMEOUT=%v HEALTH_STALE_FACTOR=%v "+
 		"SHUTDOWN_DRAIN_DELAY=%v SHUTDOWN_TIMEOUT=%v API_URL=%s API_TIMEOUT=%v "+
 		"COOKIE_SECURE=%v COOKIE_MAX_AGE=%d STATIC_DIR=%s",
-		c.port, c.adminPort, c.bindAddr, c.logLevel, c.logFormat,
+		c.port, c.adminPort, c.bindAddr, c.logLevel, c.logFormat, c.accessLog,
 		c.checkInterval, c.checkTimeout, c.staleFactor, c.drainDelay, c.drainBudget,
 		c.apiURL, c.apiTimeout, c.cookieSecure, c.cookieMaxAge, c.staticDir)
 }
@@ -199,16 +153,17 @@ func main() {
 		os.Exit(probe(os.Args[2:]))
 	}
 	cfg := loadConfig()
-	log := &logger{level: logLevels[cfg.logLevel], format: cfg.logFormat}
-	st := &state{}
-	st.snap.Store(snapshot{Results: map[string]checkResult{}})
+	log := newLogger(cfg.logLevel, cfg.logFormat)
+	st := newState()
+	m := newMetrics(cfg, st)
 
-	startAdmin(cfg, st, log)
-	go checkerLoop(cfg, st, log)
+	startAdmin(cfg, st, log, m)
+	go checkerLoop(cfg, st, log, registeredChecks(cfg))
 
 	appServer := &http.Server{
-		Handler:           newAppHandler(cfg, log),
+		Handler:           newAppHandler(cfg, log, m),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnState:         m.connState("main"),
 	}
 	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.bindAddr, strconv.Itoa(cfg.port)))
 	if err != nil {
@@ -221,8 +176,9 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-	log.infof("auth-portal listening: version=%s revision=%s config[%s]",
-		envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"), cfg.redacted())
+	log.log("info", "server", fmt.Sprintf("auth-portal listening: version=%s revision=%s config[%s]",
+		envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"), cfg.redacted()),
+		fields{"service.revision": envStr("APP_REVISION", "unknown"), "process.pid": os.Getpid()})
 
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
@@ -243,308 +199,6 @@ func main() {
 }
 
 // ---------------------------------------------------------------------------
-
-func newAppHandler(cfg *config, log *logger) http.Handler {
-	client := &http.Client{Timeout: cfg.apiTimeout}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
-		handleLogin(cfg, client, w, r)
-	})
-	mux.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
-		handleLogout(cfg, w, r)
-	})
-	mux.HandleFunc("/api/me", func(w http.ResponseWriter, r *http.Request) {
-		handleMe(cfg, client, w, r)
-	})
-	mux.HandleFunc("/api/signup", func(w http.ResponseWriter, r *http.Request) {
-		handleSignup(cfg, client, w, r)
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleStatic(cfg, w, r)
-	})
-	return mux
-}
-
-func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func hasJwtCookie(r *http.Request) bool {
-	cookie, err := r.Cookie("jwt")
-	return err == nil && cookie.Value != ""
-}
-
-func setJwtCookie(cfg *config, w http.ResponseWriter, token string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "jwt",
-		Value:    token,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   cfg.cookieSecure,
-	})
-}
-
-func handleLogin(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "Invalid body"})
-		return
-	}
-	response, err := client.Post(cfg.apiURL+"/users/login", "application/json", bytes.NewReader(body))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"message": "Server error"})
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"message": "Invalid credentials"})
-		return
-	}
-	token := strings.TrimPrefix(response.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "No token"})
-		return
-	}
-	setJwtCookie(cfg, w, token, cfg.cookieMaxAge)
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
-}
-
-func handleLogout(cfg *config, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
-		return
-	}
-	setJwtCookie(cfg, w, "", -1)
-	writeJSON(w, http.StatusOK, map[string]any{"success": true})
-}
-
-func handleMe(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
-		return
-	}
-	cookie, err := r.Cookie("jwt")
-	if err != nil || cookie.Value == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
-		return
-	}
-	request, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, cfg.apiURL+"/users/me", nil)
-	request.Header.Set("Authorization", "Bearer "+cookie.Value)
-	response, err := client.Do(request)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "Failed to fetch user"})
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		writeJSON(w, response.StatusCode, map[string]any{"error": "Failed to fetch user"})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, response.Body)
-}
-
-func handleSignup(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "Invalid body"})
-		return
-	}
-	response, err := client.Post(cfg.apiURL+"/users/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"message": "Server error"})
-		return
-	}
-	defer response.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, response.Body)
-}
-
-// handleStatic serves the exported bundle and reproduces the upstream Next
-// middleware: "/" redirects to /dashboard, /dashboard* requires the jwt
-// cookie, /login bounces authenticated users back to the dashboard.
-func handleStatic(cfg *config, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
-		return
-	}
-	clean := path.Clean("/" + r.URL.Path)
-	authed := hasJwtCookie(r)
-	switch {
-	case clean == "/":
-		http.Redirect(w, r, "/dashboard", http.StatusFound)
-		return
-	case clean == "/login" && authed:
-		http.Redirect(w, r, "/dashboard", http.StatusFound)
-		return
-	case (clean == "/dashboard" || strings.HasPrefix(clean, "/dashboard/")) && !authed:
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
-	}
-
-	full := filepath.Join(cfg.staticDir, filepath.FromSlash(clean))
-	info, err := os.Stat(full)
-	if err == nil && info.IsDir() {
-		full = filepath.Join(full, "index.html")
-		info, err = os.Stat(full)
-	}
-	if err != nil && path.Ext(clean) == "" {
-		full = filepath.Join(cfg.staticDir, filepath.FromSlash(clean)+".html")
-		info, err = os.Stat(full)
-	}
-	if err != nil || info.IsDir() {
-		notFound := filepath.Join(cfg.staticDir, "404.html")
-		if _, statErr := os.Stat(notFound); statErr == nil {
-			w.Header().Set("Cache-Control", "no-cache")
-			w.WriteHeader(http.StatusNotFound)
-			content, _ := os.ReadFile(notFound)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write(content)
-			return
-		}
-		http.NotFound(w, r)
-		return
-	}
-	if strings.HasPrefix(clean, "/_next/static/") {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	} else if strings.HasSuffix(full, ".html") || strings.HasSuffix(full, ".txt") {
-		w.Header().Set("Cache-Control", "no-cache")
-	} else {
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-	}
-	http.ServeFile(w, r, full)
-}
-
-// ---------------------------------------------------------------------------
-
-func checkerLoop(cfg *config, st *state, log *logger) {
-	client := &http.Client{Timeout: cfg.checkTimeout}
-	previous := map[string]checkResult{}
-	for {
-		cycleStart := time.Now()
-		results := map[string]checkResult{}
-
-		if _, err := os.Stat(filepath.Join(cfg.staticDir, "index.html")); err == nil {
-			results["static-root"] = checkResult{OK: true, Detail: "ok"}
-		} else {
-			results["static-root"] = checkResult{OK: false, Detail: "index.html missing: " + err.Error()}
-		}
-
-		response, err := client.Get(cfg.apiURL + "/users")
-		if err != nil {
-			results["backend-api"] = checkResult{OK: false, Detail: err.Error()}
-		} else {
-			_ = response.Body.Close()
-			results["backend-api"] = checkResult{OK: true, Detail: "ok"}
-		}
-
-		st.snap.Store(snapshot{Results: results, TakenAt: time.Now()})
-		if !st.started.Load() && allOk(results) {
-			st.started.Store(true)
-			log.infof("startup complete: first fully successful health cycle")
-		}
-		for name, result := range results {
-			if before, seen := previous[name]; seen && before.OK != result.OK {
-				log.infof("health check '%s' transitioned %v -> %v (%s)",
-					name, before.OK, result.OK, result.Detail)
-			}
-		}
-		previous = results
-		if sleep := cfg.checkInterval - time.Since(cycleStart); sleep > 0 {
-			time.Sleep(sleep)
-		}
-	}
-}
-
-func allOk(results map[string]checkResult) bool {
-	for _, result := range results {
-		if !result.OK {
-			return false
-		}
-	}
-	return len(results) > 0
-}
-
-func startAdmin(cfg *config, st *state, log *logger) {
-	fresh := func() bool {
-		snap := st.snap.Load().(snapshot)
-		return !snap.TakenAt.IsZero() &&
-			time.Since(snap.TakenAt) <= time.Duration(cfg.staleFactor*float64(cfg.checkInterval))
-	}
-	handler := func(up func() bool) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			ok := up()
-			status := http.StatusOK
-			if !ok {
-				status = http.StatusServiceUnavailable
-			}
-			if r.URL.Query().Get("verbose") == "1" {
-				snap := st.snap.Load().(snapshot)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				body, _ := json.Marshal(map[string]any{
-					"status": map[bool]string{true: "ok", false: "unavailable"}[ok],
-					"draining": st.draining.Load(), "checks": snap.Results, "takenAt": snap.TakenAt,
-				})
-				_, _ = w.Write(body)
-				return
-			}
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(status)
-			_, _ = w.Write([]byte(map[bool]string{true: "ok", false: "unavailable"}[ok]))
-		}
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/startupz", handler(func() bool { return st.started.Load() }))
-	mux.HandleFunc("/livez", handler(fresh))
-	mux.HandleFunc("/readyz", handler(func() bool {
-		snap := st.snap.Load().(snapshot)
-		return fresh() && allOk(snap.Results) && !st.draining.Load()
-	}))
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		snap := st.snap.Load().(snapshot)
-		var body strings.Builder
-		body.WriteString("# TYPE build_info gauge\n")
-		fmt.Fprintf(&body, "build_info{version=%q,revision=%q} 1\n",
-			envStr("APP_VERSION", "dev"), envStr("APP_REVISION", "unknown"))
-		body.WriteString("# TYPE health_check_up gauge\n")
-		for name, result := range snap.Results {
-			up := 0
-			if result.OK {
-				up = 1
-			}
-			fmt.Fprintf(&body, "health_check_up{check=%q} %d\n", name, up)
-		}
-		body.WriteString("# EOF\n")
-		w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
-		_, _ = w.Write([]byte(body.String()))
-	})
-	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.bindAddr, strconv.Itoa(cfg.adminPort)))
-	if err != nil {
-		fatal("cannot bind admin listener: " + err.Error())
-	}
-	server := &http.Server{Handler: mux}
-	go func() {
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			log.errorf("admin server failed: %v", err)
-			os.Exit(1)
-		}
-	}()
-}
 
 func probeHost(addr string) string {
 	switch addr {

@@ -1,5 +1,5 @@
 diff --git a/build.gradle b/build.gradle
-index c561d45..1bc9e96 100644
+index c561d45..1da124e 100644
 --- a/build.gradle
 +++ b/build.gradle
 @@ -1,6 +1,7 @@
@@ -10,7 +10,16 @@ index c561d45..1bc9e96 100644
      id 'java'
  }
  
-@@ -39,3 +40,22 @@ dependencies {
+@@ -21,6 +22,8 @@ dependencies {
+     implementation group: 'org.springframework.boot', name: 'spring-boot-starter-security', version: '4.1.0-M3'
+     implementation group: 'org.springframework.boot', name: 'spring-boot-starter-web', version: '4.1.0-M3'
+     implementation group: 'org.springframework.boot', name: 'spring-boot-starter-validation', version: '4.1.0-M3'
++    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-actuator', version: '4.1.0-M3'
++    implementation group: 'io.micrometer', name: 'micrometer-registry-prometheus'
+     implementation group: 'org.postgresql', name: 'postgresql', version: '42.7.10'
+     implementation group: 'commons-validator', name: 'commons-validator', version: '1.10.1'
+     implementation group: 'io.jsonwebtoken', name: 'jjwt-api', version: '0.13.0'
+@@ -39,3 +42,22 @@ dependencies {
  tasks.named('test') {
      useJUnitPlatform()
  }
@@ -34,12 +43,13 @@ index c561d45..1bc9e96 100644
 +    }
 +}
 diff --git a/src/main/java/com/example/jwt/JwtApplication.java b/src/main/java/com/example/jwt/JwtApplication.java
-index 187dc05..9041d7c 100644
+index 187dc05..917e8a7 100644
 --- a/src/main/java/com/example/jwt/JwtApplication.java
 +++ b/src/main/java/com/example/jwt/JwtApplication.java
-@@ -1,13 +1,44 @@
+@@ -1,13 +1,45 @@
  package com.example.jwt;
  
++import com.example.jwt.ops.EcsFlatFormatter;
 +import com.example.jwt.ops.Ops;
 +import com.example.jwt.ops.OpsConfig;
 +import com.example.jwt.ops.ProbeCommand;
@@ -69,7 +79,7 @@ index 187dc05..9041d7c 100644
 +      return;
 +    }
 +    if ("json".equals(config.logFormat())) {
-+      System.setProperty("logging.structured.format.console", "ecs");
++      System.setProperty("logging.structured.format.console", EcsFlatFormatter.class.getName());
 +    }
 +    System.setProperty("logging.level.root", config.logLevel());
 +    try {
@@ -83,16 +93,143 @@ index 187dc05..9041d7c 100644
    }
  
  }
+diff --git a/src/main/java/com/example/jwt/core/security/CustomAuthenticationFilter.java b/src/main/java/com/example/jwt/core/security/CustomAuthenticationFilter.java
+index ac84312..0cd81a9 100644
+--- a/src/main/java/com/example/jwt/core/security/CustomAuthenticationFilter.java
++++ b/src/main/java/com/example/jwt/core/security/CustomAuthenticationFilter.java
+@@ -14,18 +14,24 @@ import jakarta.servlet.http.HttpServletResponse;
+ import java.io.IOException;
+ import java.util.Date;
+ import java.util.Map;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.security.authentication.AuthenticationManager;
++import org.springframework.security.authentication.BadCredentialsException;
+ import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+ import org.springframework.security.core.Authentication;
+ import org.springframework.security.core.AuthenticationException;
++import org.springframework.security.core.userdetails.UsernameNotFoundException;
+ import org.springframework.security.core.context.SecurityContextHolder;
+ import org.springframework.security.web.authentication.AbstractAuthenticationProcessingFilter;
+ import org.springframework.security.web.util.matcher.RequestMatcher;
+ 
+ public class CustomAuthenticationFilter extends AbstractAuthenticationProcessingFilter {
+ 
++  private static final Logger log = LoggerFactory.getLogger(CustomAuthenticationFilter.class);
++
+   private final JwtProperties jwtProperties;
+ 
+   public CustomAuthenticationFilter(RequestMatcher requestMatcher,
+@@ -65,6 +71,12 @@ public class CustomAuthenticationFilter extends AbstractAuthenticationProcessing
+       Authentication authResult) {
+     response.addHeader(HttpHeaders.AUTHORIZATION,
+         AuthorizationSchemas.BEARER + " " + generateToken(authResult));
++    log.atInfo()
++        .addKeyValue("event.action", "user.login")
++        .addKeyValue("event.outcome", "success")
++        .addKeyValue("user.id",
++            String.valueOf(((UserDetailsImpl) authResult.getPrincipal()).user().getId()))
++        .log("user logged in");
+   }
+ 
+   @Override
+@@ -72,5 +84,12 @@ public class CustomAuthenticationFilter extends AbstractAuthenticationProcessing
+       HttpServletResponse response, AuthenticationException failed) {
+     SecurityContextHolder.clearContext();
+     response.setStatus(HttpStatus.UNAUTHORIZED.value());
++    String reason = failed instanceof BadCredentialsException ? "bad-credentials"
++        : failed instanceof UsernameNotFoundException ? "unknown-user" : "other";
++    log.atInfo()
++        .addKeyValue("event.action", "user.login")
++        .addKeyValue("event.outcome", "failure")
++        .addKeyValue("reason", reason)
++        .log("user login rejected");
+   }
+ }
+diff --git a/src/main/java/com/example/jwt/core/security/WebSecurityConfig.java b/src/main/java/com/example/jwt/core/security/WebSecurityConfig.java
+index 6090536..cb92354 100644
+--- a/src/main/java/com/example/jwt/core/security/WebSecurityConfig.java
++++ b/src/main/java/com/example/jwt/core/security/WebSecurityConfig.java
+@@ -76,6 +76,7 @@ public class WebSecurityConfig {
+   public AuthenticationManager authenticationManager() {
+     DaoAuthenticationProvider provider = new DaoAuthenticationProvider(userService);
+     provider.setPasswordEncoder(passwordEncoder);
++    provider.setHideUserNotFoundExceptions(false);
+     return new ProviderManager(provider);
+   }
+ 
+diff --git a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+index 60fffa5..9c3b9e3 100644
+--- a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
++++ b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+@@ -1,7 +1,10 @@
+ package com.example.jwt.domain.user;
+ 
+ import com.example.jwt.core.generic.ExtendedServiceImpl;
++import java.util.NoSuchElementException;
++import java.util.UUID;
+ import org.slf4j.Logger;
++import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.security.core.userdetails.UserDetails;
+ import org.springframework.security.core.userdetails.UsernameNotFoundException;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+@@ -27,6 +30,42 @@ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserSe
+   @Override
+   public User register(User user) {
+     user.setPassword(passwordEncoder.encode(user.getPassword()));
+-    return save(user);
++    try {
++      User saved = save(user);
++      logger.atInfo()
++          .addKeyValue("event.action", "user.register")
++          .addKeyValue("event.outcome", "success")
++          .addKeyValue("user.id", String.valueOf(saved.getId()))
++          .log("user registered");
++      return saved;
++    } catch (DataIntegrityViolationException e) {
++      logger.atInfo()
++          .addKeyValue("event.action", "user.register")
++          .addKeyValue("event.outcome", "failure")
++          .addKeyValue("reason", "duplicate-email")
++          .log("user registration rejected");
++      throw e;
++    }
++  }
++
++  @Override
++  public Void deleteById(UUID id) throws NoSuchElementException {
++    try {
++      super.deleteById(id);
++    } catch (NoSuchElementException e) {
++      logger.atInfo()
++          .addKeyValue("event.action", "user.delete")
++          .addKeyValue("event.outcome", "failure")
++          .addKeyValue("reason", "unknown-user")
++          .addKeyValue("user.id", String.valueOf(id))
++          .log("user deletion rejected");
++      throw e;
++    }
++    logger.atInfo()
++        .addKeyValue("event.action", "user.delete")
++        .addKeyValue("event.outcome", "success")
++        .addKeyValue("user.id", String.valueOf(id))
++        .log("user deleted");
++    return null;
+   }
+ }
 diff --git a/src/main/java/com/example/jwt/ops/AdminServer.java b/src/main/java/com/example/jwt/ops/AdminServer.java
 new file mode 100644
-index 0000000..c91b6f7
+index 0000000..21582c8
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/AdminServer.java
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,104 @@
 +package com.example.jwt.ops;
 +
 +import com.sun.net.httpserver.HttpExchange;
 +import com.sun.net.httpserver.HttpServer;
++import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 +import java.io.IOException;
 +import java.io.OutputStream;
 +import java.net.InetSocketAddress;
@@ -157,26 +294,24 @@ index 0000000..c91b6f7
 +      first = false;
 +      json.append('"').append(entry.getKey()).append("\":{\"ok\":").append(entry.getValue().ok())
 +          .append(",\"detail\":\"").append(entry.getValue().detail().replace("\"", "'"))
-+          .append("\"}");
++          .append("\",\"durationMillis\":").append(entry.getValue().durationNanos() / 1_000_000L)
++          .append(",\"lastSuccessMillis\":").append(entry.getValue().lastSuccessMillis())
++          .append('}');
 +    }
 +    return json.append("}}").toString();
 +  }
 +
++  /**
++   * The application registry (when the context has handed it over) in front of
++   * the ops families; before that, the ops families alone — still 200, still
++   * OpenMetrics, so a scrape never depends on the framework being up.
++   */
 +  private void metrics(HttpExchange exchange) throws IOException {
-+    String version = envOr("APP_VERSION", "dev");
-+    String revision = envOr("APP_REVISION", "unknown");
-+    StringBuilder body = new StringBuilder();
-+    body.append("# TYPE build_info gauge\n");
-+    body.append("build_info{version=\"").append(version).append("\",revision=\"").append(revision)
-+        .append("\"} 1\n");
-+    body.append("# TYPE health_check_up gauge\n");
-+    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : state.snapshot().results().entrySet()) {
-+      body.append("health_check_up{check=\"").append(entry.getKey()).append("\"} ")
-+          .append(entry.getValue().ok() ? 1 : 0).append('\n');
-+    }
-+    body.append("# EOF\n");
-+    respond(exchange, 200, body.toString(),
-+        "application/openmetrics-text; version=1.0.0; charset=utf-8");
++    PrometheusMeterRegistry registry = Ops.meterRegistry();
++    String scrape = registry == null ? null : registry.scrape(OpenMetricsExposition.CONTENT_TYPE);
++    String body = OpenMetricsExposition.compose(scrape, state, System.currentTimeMillis(),
++        envOr("APP_VERSION", "dev"), envOr("APP_REVISION", "unknown"));
++    respond(exchange, 200, body, OpenMetricsExposition.CONTENT_TYPE);
 +  }
 +
 +  private static void respond(HttpExchange exchange, int status, String body, String contentType)
@@ -187,6 +322,113 @@ index 0000000..c91b6f7
 +    try (OutputStream out = exchange.getResponseBody()) {
 +      out.write(bytes);
 +    }
++  }
++
++  private static String envOr(String name, String fallback) {
++    String value = System.getenv(name);
++    return (value == null || value.isBlank()) ? fallback : value;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/EcsFlatFormatter.java b/src/main/java/com/example/jwt/ops/EcsFlatFormatter.java
+new file mode 100644
+index 0000000..e22aac0
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/EcsFlatFormatter.java
+@@ -0,0 +1,101 @@
++package com.example.jwt.ops;
++
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.classic.spi.IThrowableProxy;
++import ch.qos.logback.classic.spi.ThrowableProxyUtil;
++import java.time.format.DateTimeFormatter;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import org.slf4j.event.KeyValuePair;
++import org.springframework.boot.logging.structured.StructuredLogFormatter;
++
++/**
++ * The log shape shared by every image of the stack: one JSON object per line
++ * with flat, dotted ECS field names (Spring Boot's built-in ECS format nests
++ * them), lower-case levels, the fixed service fields, MDC entries and
++ * key-value pairs as top-level members. Selected through
++ * {@code logging.structured.format.console} when LOG_FORMAT=json.
++ */
++public final class EcsFlatFormatter implements StructuredLogFormatter<ILoggingEvent> {
++
++  private static final String SERVICE_NAME = "user-mgmt-service";
++  private static final String SERVICE_VERSION = envOr("APP_VERSION", "dev");
++  private static final long PID = ProcessHandle.current().pid();
++
++  public EcsFlatFormatter() {}
++
++  @Override
++  public String format(ILoggingEvent event) {
++    StringBuilder out = new StringBuilder(320);
++    out.append("{\"@timestamp\":\"").append(DateTimeFormatter.ISO_INSTANT.format(event.getInstant())).append('"');
++    text(out, "log.level", event.getLevel().toString().toLowerCase(Locale.ROOT));
++    text(out, "log.logger", event.getLoggerName());
++    text(out, "message", event.getFormattedMessage());
++    text(out, "ecs.version", "8.11");
++    text(out, "service.name", SERVICE_NAME);
++    text(out, "service.version", SERVICE_VERSION);
++    out.append(",\"process.pid\":").append(PID);
++    text(out, "process.thread.name", event.getThreadName());
++    Map<String, String> mdc = event.getMDCPropertyMap();
++    if (mdc != null) {
++      for (Map.Entry<String, String> entry : mdc.entrySet()) {
++        text(out, entry.getKey(), entry.getValue());
++      }
++    }
++    List<KeyValuePair> pairs = event.getKeyValuePairs();
++    if (pairs != null) {
++      for (KeyValuePair pair : pairs) {
++        value(out, pair.key, pair.value);
++      }
++    }
++    IThrowableProxy throwable = event.getThrowableProxy();
++    if (throwable != null) {
++      text(out, "error.type", throwable.getClassName());
++      text(out, "error.message", throwable.getMessage());
++      text(out, "error.stack_trace", ThrowableProxyUtil.asString(throwable));
++    }
++    return out.append("}\n").toString();
++  }
++
++  private static void value(StringBuilder out, String key, Object value) {
++    if (value instanceof Number || value instanceof Boolean) {
++      out.append(",\"").append(escape(key)).append("\":").append(value);
++    } else {
++      text(out, key, String.valueOf(value));
++    }
++  }
++
++  private static void text(StringBuilder out, String key, String value) {
++    out.append(",\"").append(escape(key)).append("\":\"").append(escape(value == null ? "" : value)).append('"');
++  }
++
++  private static String escape(String value) {
++    StringBuilder sb = null;
++    for (int i = 0; i < value.length(); i++) {
++      char c = value.charAt(i);
++      String replacement = switch (c) {
++        case '"' -> "\\\"";
++        case '\\' -> "\\\\";
++        case '\n' -> "\\n";
++        case '\r' -> "\\r";
++        case '\t' -> "\\t";
++        default -> c < 0x20 ? String.format("\\u%04x", (int) c) : null;
++      };
++      if (replacement != null) {
++        if (sb == null) {
++          sb = new StringBuilder(value.length() + 16).append(value, 0, i);
++        }
++        sb.append(replacement);
++      } else if (sb != null) {
++        sb.append(c);
++      }
++    }
++    return sb == null ? value : sb.toString();
 +  }
 +
 +  private static String envOr(String name, String fallback) {
@@ -212,10 +454,10 @@ index 0000000..99d001d
 +}
 diff --git a/src/main/java/com/example/jwt/ops/HealthChecker.java b/src/main/java/com/example/jwt/ops/HealthChecker.java
 new file mode 100644
-index 0000000..f8acbfc
+index 0000000..2eb21f0
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/HealthChecker.java
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,142 @@
 +package com.example.jwt.ops;
 +
 +import java.util.LinkedHashMap;
@@ -238,6 +480,9 @@ index 0000000..f8acbfc
 +public final class HealthChecker implements Runnable {
 +
 +  private static final Logger log = LoggerFactory.getLogger(HealthChecker.class);
++
++  /** Outcome of one check run, measured inside the worker so a failure keeps its duration. */
++  private record Outcome(boolean ok, String detail, long durationNanos) {}
 +
 +  private final OpsConfig config;
 +  private final HealthState state;
@@ -288,32 +533,44 @@ index 0000000..f8acbfc
 +  private void runCycle() {
 +    Map<String, HealthSnapshot.CheckResult> previous = state.snapshot().results();
 +    Map<String, HealthSnapshot.CheckResult> results = new LinkedHashMap<>();
-+    results.put("spring-context", state.contextReady()
-+        ? new HealthSnapshot.CheckResult(true, "application context ready")
-+        : new HealthSnapshot.CheckResult(false, "application context not ready yet"));
++    long now = System.currentTimeMillis();
++    boolean contextReady = state.contextReady();
++    results.put("spring-context", new HealthSnapshot.CheckResult(contextReady,
++        contextReady ? "application context ready" : "application context not ready yet", 0L,
++        contextReady ? now : lastSuccess(previous, "spring-context")));
 +
 +    List<HealthCheck> current = List.copyOf(checks);
-+    Map<String, Future<?>> futures = new LinkedHashMap<>();
++    Map<String, Future<Outcome>> futures = new LinkedHashMap<>();
 +    for (HealthCheck check : current) {
 +      futures.put(check.name(), executor.submit(() -> {
-+        check.run();
-+        return null;
++        long begin = System.nanoTime();
++        try {
++          check.run();
++          return new Outcome(true, "ok", System.nanoTime() - begin);
++        } catch (Throwable t) {
++          return new Outcome(false, String.valueOf(t.getMessage()), System.nanoTime() - begin);
++        }
 +      }));
 +    }
-+    for (Map.Entry<String, Future<?>> entry : futures.entrySet()) {
++    long timeoutNanos = TimeUnit.SECONDS.toNanos(config.healthCheckTimeout());
++    for (Map.Entry<String, Future<Outcome>> entry : futures.entrySet()) {
++      String name = entry.getKey();
 +      HealthSnapshot.CheckResult result;
 +      try {
-+        entry.getValue().get(config.healthCheckTimeout(), TimeUnit.SECONDS);
-+        result = new HealthSnapshot.CheckResult(true, "ok");
++        Outcome outcome = entry.getValue().get(config.healthCheckTimeout(), TimeUnit.SECONDS);
++        result = new HealthSnapshot.CheckResult(outcome.ok(), outcome.detail(), outcome.durationNanos(),
++            outcome.ok() ? System.currentTimeMillis() : lastSuccess(previous, name));
 +      } catch (TimeoutException e) {
 +        entry.getValue().cancel(true);
 +        result = new HealthSnapshot.CheckResult(false,
-+            "timed out after " + config.healthCheckTimeout() + "s");
++            "timed out after " + config.healthCheckTimeout() + "s", timeoutNanos,
++            lastSuccess(previous, name));
 +      } catch (Exception e) {
 +        Throwable cause = e.getCause() != null ? e.getCause() : e;
-+        result = new HealthSnapshot.CheckResult(false, String.valueOf(cause.getMessage()));
++        result = new HealthSnapshot.CheckResult(false, String.valueOf(cause.getMessage()),
++            timeoutNanos, lastSuccess(previous, name));
 +      }
-+      results.put(entry.getKey(), result);
++      results.put(name, result);
 +    }
 +
 +    HealthSnapshot next = new HealthSnapshot(Map.copyOf(results), System.currentTimeMillis());
@@ -324,6 +581,11 @@ index 0000000..f8acbfc
 +      log.info("startup complete: first fully successful health cycle");
 +    }
 +    logTransitions(previous, results);
++  }
++
++  private static long lastSuccess(Map<String, HealthSnapshot.CheckResult> previous, String name) {
++    HealthSnapshot.CheckResult before = previous.get(name);
++    return before == null ? 0L : before.lastSuccessMillis();
 +  }
 +
 +  private void logTransitions(Map<String, HealthSnapshot.CheckResult> previous,
@@ -340,10 +602,10 @@ index 0000000..f8acbfc
 +}
 diff --git a/src/main/java/com/example/jwt/ops/HealthSnapshot.java b/src/main/java/com/example/jwt/ops/HealthSnapshot.java
 new file mode 100644
-index 0000000..1e0f402
+index 0000000..2fa161e
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/HealthSnapshot.java
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,18 @@
 +package com.example.jwt.ops;
 +
 +import java.util.Map;
@@ -351,7 +613,12 @@ index 0000000..1e0f402
 +/** Immutable result of one full check cycle; swapped behind a single atomic reference. */
 +public record HealthSnapshot(Map<String, CheckResult> results, long takenAtMillis) {
 +
-+  public record CheckResult(boolean ok, String detail) {}
++  /**
++   * One check's outcome: pass/fail with a human detail, how long the last run
++   * took, and when the check last passed (0 until it ever did — carried over
++   * from earlier cycles while the check is failing).
++   */
++  public record CheckResult(boolean ok, String detail, long durationNanos, long lastSuccessMillis) {}
 +
 +  public boolean allOk() {
 +    return results.values().stream().allMatch(CheckResult::ok);
@@ -359,13 +626,14 @@ index 0000000..1e0f402
 +}
 diff --git a/src/main/java/com/example/jwt/ops/HealthState.java b/src/main/java/com/example/jwt/ops/HealthState.java
 new file mode 100644
-index 0000000..a2851c9
+index 0000000..7c2e3e9
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/HealthState.java
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,67 @@
 +package com.example.jwt.ops;
 +
 +import java.util.Map;
++import java.util.concurrent.atomic.AtomicLong;
 +import java.util.concurrent.atomic.AtomicReference;
 +
 +/** Shared, lock-free health state read by the admin endpoints. */
@@ -373,6 +641,7 @@ index 0000000..a2851c9
 +
 +  private final AtomicReference<HealthSnapshot> snapshot =
 +      new AtomicReference<>(new HealthSnapshot(Map.of(), 0L));
++  private final AtomicLong cycles = new AtomicLong();
 +  private volatile boolean started;
 +  private volatile boolean draining;
 +  private volatile boolean contextReady;
@@ -383,6 +652,12 @@ index 0000000..a2851c9
 +
 +  public void swapSnapshot(HealthSnapshot next) {
 +    snapshot.set(next);
++    cycles.incrementAndGet();
++  }
++
++  /** Completed checker cycles since process start. */
++  public long cycles() {
++    return cycles.get();
 +  }
 +
 +  public boolean started() {
@@ -422,14 +697,190 @@ index 0000000..a2851c9
 +    return fresh(config, nowMillis) && snapshot.get().allOk() && !draining;
 +  }
 +}
-diff --git a/src/main/java/com/example/jwt/ops/Ops.java b/src/main/java/com/example/jwt/ops/Ops.java
+diff --git a/src/main/java/com/example/jwt/ops/OpenMetricsExposition.java b/src/main/java/com/example/jwt/ops/OpenMetricsExposition.java
 new file mode 100644
-index 0000000..7bfbbb7
+index 0000000..27b3616
 --- /dev/null
-+++ b/src/main/java/com/example/jwt/ops/Ops.java
-@@ -0,0 +1,39 @@
++++ b/src/main/java/com/example/jwt/ops/OpenMetricsExposition.java
+@@ -0,0 +1,169 @@
 +package com.example.jwt.ops;
 +
++import java.util.Map;
++
++/**
++ * Composes the OpenMetrics body served on ADMIN_PORT: the application's
++ * registry output (normalised to HELP/TYPE/UNIT order with a HELP line for
++ * every family, its own terminator removed), then the ops families the image
++ * contract promises independently of the framework, then one final "# EOF".
++ */
++public final class OpenMetricsExposition {
++
++  public static final String CONTENT_TYPE =
++      "application/openmetrics-text; version=1.0.0; charset=utf-8";
++
++  private OpenMetricsExposition() {}
++
++  public static String compose(String registryScrape, HealthState state, long nowMillis,
++      String version, String revision) {
++    StringBuilder body = new StringBuilder(registryScrape == null ? 2048 : registryScrape.length() + 2048);
++    if (registryScrape != null && !registryScrape.isEmpty()) {
++      normalize(registryScrape, body);
++    }
++    opsFamilies(state, nowMillis, version, revision, body);
++    body.append("# EOF\n");
++    return body.toString();
++  }
++
++  /**
++   * The Prometheus Java client writes "# TYPE" before "# HELP" and omits the
++   * HELP line for meters without a description; classic tooling (promtool
++   * lint) expects HELP first and present. Metadata lines of one family are
++   * buffered and re-emitted as HELP, TYPE, UNIT; "# EOF" is dropped so the
++   * caller can append its own families.
++   */
++  static void normalize(String scrape, StringBuilder out) {
++    String name = null;
++    String help = null;
++    String type = null;
++    String unit = null;
++    int start = 0;
++    int length = scrape.length();
++    while (start < length) {
++      int end = scrape.indexOf('\n', start);
++      if (end < 0) {
++        end = length;
++      }
++      String line = scrape.substring(start, end);
++      start = end + 1;
++      if (line.equals("# EOF")) {
++        continue;
++      }
++      String kind = metadataKind(line);
++      if (kind != null) {
++        int nameStart = 2 + kind.length() + 1;
++        int nameEnd = line.indexOf(' ', nameStart);
++        String lineName = nameEnd < 0 ? line.substring(nameStart) : line.substring(nameStart, nameEnd);
++        if (!lineName.equals(name)) {
++          flush(name, help, type, unit, out);
++          name = lineName;
++          help = null;
++          type = null;
++          unit = null;
++        }
++        switch (kind) {
++          case "HELP" -> help = line;
++          case "TYPE" -> type = line;
++          default -> unit = line;
++        }
++        continue;
++      }
++      flush(name, help, type, unit, out);
++      name = null;
++      help = null;
++      type = null;
++      unit = null;
++      out.append(line).append('\n');
++    }
++    flush(name, help, type, unit, out);
++  }
++
++  private static String metadataKind(String line) {
++    if (line.startsWith("# HELP ")) {
++      return "HELP";
++    }
++    if (line.startsWith("# TYPE ")) {
++      return "TYPE";
++    }
++    if (line.startsWith("# UNIT ")) {
++      return "UNIT";
++    }
++    return null;
++  }
++
++  private static void flush(String name, String help, String type, String unit, StringBuilder out) {
++    if (name == null) {
++      return;
++    }
++    if (help == null || help.substring(Math.min(help.length(), 7 + name.length())).isBlank()) {
++      out.append("# HELP ").append(name).append(" Micrometer meter ").append(name)
++          .append(" (no description registered).\n");
++    } else {
++      out.append(help).append('\n');
++    }
++    if (type != null) {
++      out.append(type).append('\n');
++    }
++    if (unit != null) {
++      out.append(unit).append('\n');
++    }
++  }
++
++  static void opsFamilies(HealthState state, long nowMillis, String version, String revision,
++      StringBuilder out) {
++    HealthSnapshot snapshot = state.snapshot();
++    out.append("# HELP build_info The running artifact: packaged-software version and VCS revision (always 1).\n")
++        .append("# TYPE build_info gauge\n")
++        .append("build_info{version=\"").append(escape(version)).append("\",revision=\"")
++        .append(escape(revision)).append("\"} 1\n");
++
++    out.append("# HELP health_check_up 1 when the check passed in the last checker cycle.\n")
++        .append("# TYPE health_check_up gauge\n");
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : snapshot.results().entrySet()) {
++      out.append("health_check_up{check=\"").append(escape(entry.getKey())).append("\"} ")
++          .append(entry.getValue().ok() ? 1 : 0).append('\n');
++    }
++
++    out.append("# HELP health_check_duration_seconds Duration of the last run of the check.\n")
++        .append("# TYPE health_check_duration_seconds gauge\n");
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : snapshot.results().entrySet()) {
++      out.append("health_check_duration_seconds{check=\"").append(escape(entry.getKey())).append("\"} ")
++          .append(entry.getValue().durationNanos() / 1e9).append('\n');
++    }
++
++    out.append("# HELP health_check_last_success_timestamp_seconds Unix time of the last pass of the check (0 until it first passed).\n")
++        .append("# TYPE health_check_last_success_timestamp_seconds gauge\n");
++    for (Map.Entry<String, HealthSnapshot.CheckResult> entry : snapshot.results().entrySet()) {
++      out.append("health_check_last_success_timestamp_seconds{check=\"").append(escape(entry.getKey()))
++          .append("\"} ").append(entry.getValue().lastSuccessMillis() / 1e3).append('\n');
++    }
++
++    double age = snapshot.takenAtMillis() == 0 ? 0.0 : (nowMillis - snapshot.takenAtMillis()) / 1e3;
++    out.append("# HELP health_snapshot_age_seconds Age of the cached health snapshot the probes read.\n")
++        .append("# TYPE health_snapshot_age_seconds gauge\n")
++        .append("health_snapshot_age_seconds ").append(age).append('\n');
++
++    out.append("# HELP health_checker_cycles Completed health checker cycles since process start.\n")
++        .append("# TYPE health_checker_cycles counter\n")
++        .append("health_checker_cycles_total ").append(state.cycles()).append('\n');
++
++    out.append("# HELP health_draining 1 once the shutdown drain latch is set (readiness is 503 from then on).\n")
++        .append("# TYPE health_draining gauge\n")
++        .append("health_draining ").append(state.draining() ? 1 : 0).append('\n');
++  }
++
++  private static String escape(String value) {
++    StringBuilder sb = new StringBuilder(value.length());
++    for (int i = 0; i < value.length(); i++) {
++      char c = value.charAt(i);
++      switch (c) {
++        case '\\' -> sb.append("\\\\");
++        case '"' -> sb.append("\\\"");
++        case '\n' -> sb.append("\\n");
++        default -> sb.append(c);
++      }
++    }
++    return sb.toString();
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/Ops.java b/src/main/java/com/example/jwt/ops/Ops.java
+new file mode 100644
+index 0000000..e222b12
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/Ops.java
+@@ -0,0 +1,54 @@
++package com.example.jwt.ops;
++
++import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 +import java.io.IOException;
 +
 +/**
@@ -443,6 +894,7 @@ index 0000000..7bfbbb7
 +  private static volatile HealthState state;
 +  private static volatile HealthChecker checker;
 +  private static volatile AdminServer admin;
++  private static volatile PrometheusMeterRegistry meterRegistry;
 +
 +  private Ops() {}
 +
@@ -466,16 +918,34 @@ index 0000000..7bfbbb7
 +  public static void registerCheck(HealthCheck check) {
 +    checker.register(check);
 +  }
++
++  /**
++   * Hands the application's Prometheus registry to the admin listener: from
++   * now on /metrics serves the Micrometer families in front of the ops ones.
++   */
++  public static void registerMeterRegistry(PrometheusMeterRegistry registry) {
++    meterRegistry = registry;
++  }
++
++  /** The application registry, or null while the context is still starting. */
++  public static PrometheusMeterRegistry meterRegistry() {
++    return meterRegistry;
++  }
 +}
 diff --git a/src/main/java/com/example/jwt/ops/OpsBootstrap.java b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
 new file mode 100644
-index 0000000..f0e57d6
+index 0000000..e48ffd6
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,121 @@
 +package com.example.jwt.ops;
 +
 +import com.example.jwt.core.security.helpers.Credentials;
++import io.micrometer.core.instrument.Meter;
++import io.micrometer.core.instrument.MeterRegistry;
++import io.micrometer.core.instrument.config.MeterFilter;
++import io.micrometer.core.instrument.config.MeterFilterReply;
++import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 +import java.sql.Connection;
 +import java.sql.Statement;
 +import javax.sql.DataSource;
@@ -483,14 +953,22 @@ index 0000000..f0e57d6
 +import org.slf4j.LoggerFactory;
 +import org.springframework.aot.hint.annotation.RegisterReflectionForBinding;
 +import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.boot.tomcat.TomcatWebServer;
++import org.springframework.boot.web.server.context.WebServerApplicationContext;
++import org.springframework.boot.web.servlet.FilterRegistrationBean;
++import org.springframework.context.annotation.Bean;
 +import org.springframework.context.annotation.Configuration;
 +import org.springframework.context.annotation.ImportRuntimeHints;
 +import org.springframework.context.event.EventListener;
++import org.springframework.core.Ordered;
 +
 +/**
-+ * Registers the service-function-derived checks once the context is up. The
-+ * reflection hint covers the hand-instantiated ObjectMapper deserialization of
-+ * Credentials in CustomAuthenticationFilter, which Spring AOT cannot discover.
++ * Wires the Spring-managed pieces into the ops layer started in main(): the
++ * service-function-derived checks, the Prometheus registry behind /metrics,
++ * the listener traffic gauges, and the request filter of the main listener.
++ * The reflection hint covers the hand-instantiated ObjectMapper
++ * deserialization of Credentials in CustomAuthenticationFilter, which Spring
++ * AOT cannot discover.
 + */
 +@Configuration(proxyBeanMethods = false)
 +@ImportRuntimeHints(OpsRuntimeHints.class)
@@ -501,13 +979,64 @@ index 0000000..f0e57d6
 +
 +  private final DataSource dataSource;
 +
-+  public OpsBootstrap(DataSource dataSource) {
++  public OpsBootstrap(DataSource dataSource, PrometheusMeterRegistry registry) {
 +    this.dataSource = dataSource;
++    Ops.registerMeterRegistry(registry);
++  }
++
++  /**
++   * Meter-level corrections: a name promtool rejects, and a timer whose route
++   * label cannot be right. Static: the registry applies filters while it is
++   * being created, before this configuration instance (which needs the
++   * registry) exists.
++   */
++  @Bean
++  public static MeterFilter contractNamesMeterFilter() {
++    return new MeterFilter() {
++      @Override
++      public Meter.Id map(Meter.Id id) {
++        return "system.cpu.count".equals(id.getName()) ? id.withName("system.cpus") : id;
++      }
++
++      /**
++       * Micrometer's long task timer for http.server.requests is tagged when the
++       * observation starts, before any route is known, so its uri is always
++       * UNKNOWN; the image serves the plain http_server_requests_active gauge
++       * instead (RequestMetricsFilter), the same family as the other images.
++       */
++      @Override
++      public MeterFilterReply accept(Meter.Id id) {
++        return "http.server.requests.active".equals(id.getName()) && id.getType() == Meter.Type.LONG_TASK_TIMER
++            ? MeterFilterReply.DENY : MeterFilterReply.NEUTRAL;
++      }
++    };
++  }
++
++  @Bean
++  public FilterRegistrationBean<RequestMetricsFilter> requestMetricsFilter(MeterRegistry registry) {
++    OpsConfig config = Ops.config();
++    boolean accessLog = config != null && config.accessLog();
++    FilterRegistrationBean<RequestMetricsFilter> registration =
++        new FilterRegistrationBean<>(new RequestMetricsFilter(registry, accessLog));
++    // inside ServerHttpObservationFilter (HIGHEST_PRECEDENCE + 1), so the route
++    // template can be recorded on the request observation; still ahead of the
++    // security chain
++    registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 2);
++    registration.addUrlPatterns("/*");
++    registration.setName("requestMetricsFilter");
++    return registration;
 +  }
 +
 +  @EventListener(ApplicationReadyEvent.class)
-+  public void onApplicationReady() {
++  public void onApplicationReady(ApplicationReadyEvent event) {
 +    OpsConfig config = Ops.config();
++    // After Micrometer's own Tomcat binder (ApplicationStartedEvent), so the
++    // connector gauges only fill in what JMX could not provide.
++    if (event.getApplicationContext() instanceof WebServerApplicationContext web
++        && web.getWebServer() instanceof TomcatWebServer tomcat) {
++      TomcatConnectorMetrics.bind(event.getApplicationContext().getBean(MeterRegistry.class),
++          tomcat.getTomcat());
++    }
 +    Ops.registerCheck(new HealthCheck() {
 +      @Override
 +      public String name() {
@@ -532,10 +1061,10 @@ index 0000000..f0e57d6
 +}
 diff --git a/src/main/java/com/example/jwt/ops/OpsConfig.java b/src/main/java/com/example/jwt/ops/OpsConfig.java
 new file mode 100644
-index 0000000..f1d17e1
+index 0000000..ab148ce
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/OpsConfig.java
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,108 @@
 +package com.example.jwt.ops;
 +
 +import java.util.List;
@@ -550,6 +1079,7 @@ index 0000000..f1d17e1
 +    String bindAddr,
 +    String logLevel,
 +    String logFormat,
++    boolean accessLog,
 +    int healthCheckInterval,
 +    int healthCheckTimeout,
 +    double healthStaleFactor,
@@ -562,6 +1092,7 @@ index 0000000..f1d17e1
 +    String bindAddr = env("BIND_ADDR", "0.0.0.0");
 +    String logLevel = enumEnv("LOG_LEVEL", "info", List.of("trace", "debug", "info", "warn", "error"));
 +    String logFormat = enumEnv("LOG_FORMAT", "json", List.of("json", "text"));
++    boolean accessLog = boolEnv("ACCESS_LOG", false);
 +    int interval = intEnv("HEALTH_CHECK_INTERVAL", 5, 1, 3600);
 +    int timeout = intEnv("HEALTH_CHECK_TIMEOUT", 2, 1, 3600);
 +    double staleFactor = doubleEnv("HEALTH_STALE_FACTOR", 3.0, 1.0, 100.0);
@@ -574,7 +1105,7 @@ index 0000000..f1d17e1
 +    if (port == adminPort) {
 +      throw new IllegalStateException("PORT and ADMIN_PORT must differ (both " + port + ")");
 +    }
-+    return new OpsConfig(port, adminPort, bindAddr, logLevel, logFormat,
++    return new OpsConfig(port, adminPort, bindAddr, logLevel, logFormat, accessLog,
 +        interval, timeout, staleFactor, drainDelay, shutdownTimeout);
 +  }
 +
@@ -584,6 +1115,7 @@ index 0000000..f1d17e1
 +        + " BIND_ADDR=" + bindAddr
 +        + " LOG_LEVEL=" + logLevel
 +        + " LOG_FORMAT=" + logFormat
++        + " ACCESS_LOG=" + accessLog
 +        + " HEALTH_CHECK_INTERVAL=" + healthCheckInterval
 +        + " HEALTH_CHECK_TIMEOUT=" + healthCheckTimeout
 +        + " HEALTH_STALE_FACTOR=" + healthStaleFactor
@@ -602,6 +1134,15 @@ index 0000000..f1d17e1
 +      throw new IllegalStateException(name + "=" + value + " is invalid; allowed: " + allowed);
 +    }
 +    return value;
++  }
++
++  private static boolean boolEnv(String name, boolean fallback) {
++    String value = env(name, Boolean.toString(fallback)).toLowerCase();
++    return switch (value) {
++      case "true", "1", "yes" -> true;
++      case "false", "0", "no" -> false;
++      default -> throw new IllegalStateException(name + "=" + value + " is not a boolean");
++    };
 +  }
 +
 +  private static int intEnv(String name, int fallback, int min, int max) {
@@ -634,10 +1175,10 @@ index 0000000..f1d17e1
 +}
 diff --git a/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java b/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java
 new file mode 100644
-index 0000000..bc0860b
+index 0000000..5efbeb5
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/OpsRuntimeHints.java
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,34 @@
 +package com.example.jwt.ops;
 +
 +import org.springframework.aot.hint.MemberCategory;
@@ -652,6 +1193,16 @@ index 0000000..bc0860b
 +    hints.resources().registerResourceBundle("messages");
 +    hints.resources().registerResourceBundle("validationMessages");
 +    hints.reflection().registerType(java.util.UUID[].class);
++    // The structured log formatter is loaded by name from the logging system.
++    hints.reflection().registerType(EcsFlatFormatter.class, MemberCategory.INVOKE_DECLARED_CONSTRUCTORS);
++    // Tomcat configures its connector through IntrospectionUtils (reflective
++    // setters on the protocol handler and its endpoint); the reachability
++    // metadata registers those only under conditions the image does not meet.
++    hints.reflection().registerType(org.apache.coyote.AbstractProtocol.class, MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(org.apache.coyote.http11.AbstractHttp11Protocol.class, MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(org.apache.coyote.http11.Http11NioProtocol.class, MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(org.apache.tomcat.util.net.AbstractEndpoint.class, MemberCategory.INVOKE_PUBLIC_METHODS);
++    hints.reflection().registerType(org.apache.tomcat.util.net.NioEndpoint.class, MemberCategory.INVOKE_PUBLIC_METHODS);
 +    // JWT claim serialization of granted authorities and SpEL in @PreAuthorize
 +    // (authentication.principal.user, @userPermissionEvaluator) use reflection.
 +    hints.reflection().registerType(org.springframework.security.core.authority.SimpleGrantedAuthority.class,
@@ -723,6 +1274,386 @@ index 0000000..18f70ca
 +      return "[::1]";
 +    }
 +    return addr.contains(":") ? "[" + addr + "]" : addr;
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/RequestMetricsFilter.java b/src/main/java/com/example/jwt/ops/RequestMetricsFilter.java
+new file mode 100644
+index 0000000..d690e80
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/RequestMetricsFilter.java
+@@ -0,0 +1,274 @@
++package com.example.jwt.ops;
++
++import io.micrometer.core.instrument.Counter;
++import io.micrometer.core.instrument.Gauge;
++import io.micrometer.core.instrument.MeterRegistry;
++import jakarta.servlet.FilterChain;
++import jakarta.servlet.ReadListener;
++import jakarta.servlet.ServletException;
++import jakarta.servlet.ServletInputStream;
++import jakarta.servlet.ServletOutputStream;
++import jakarta.servlet.WriteListener;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletRequestWrapper;
++import jakarta.servlet.http.HttpServletResponse;
++import jakarta.servlet.http.HttpServletResponseWrapper;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.Set;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.regex.Pattern;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.slf4j.MDC;
++import org.springframework.web.filter.OncePerRequestFilter;
++
++/**
++ * Request filter of the main listener, directly inside Spring's request
++ * observation filter: request-id correlation
++ * (X-Request-Id in, echoed out, MDC http.request.id), per-route request and
++ * response byte counters, the route template for requests the security chain
++ * answers itself, and the optional access log line. Never touches the admin
++ * listener, never logs headers, bodies, query strings or client addresses.
++ */
++public final class RequestMetricsFilter extends OncePerRequestFilter {
++
++  public static final String REQUEST_ID_HEADER = "X-Request-Id";
++  public static final String MDC_REQUEST_ID = "http.request.id";
++
++  private static final Pattern REQUEST_ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
++  private static final Logger access = LoggerFactory.getLogger("access");
++
++  private static final Set<String> METHODS = Set.of("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS");
++
++  private final MeterRegistry registry;
++  private final boolean accessLog;
++  private final ConcurrentHashMap<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
++
++  public RequestMetricsFilter(MeterRegistry registry, boolean accessLog) {
++    this.registry = registry;
++    this.accessLog = accessLog;
++  }
++
++  @Override
++  protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
++      FilterChain chain) throws ServletException, IOException {
++    String requestId = requestId(request);
++    MDC.put(MDC_REQUEST_ID, requestId);
++    response.setHeader(REQUEST_ID_HEADER, requestId);
++    String known = RouteTemplates.match(request.getMethod(), RouteTemplates.path(request));
++    if (known != null) {
++      RouteTemplates.announce(request, known);
++    }
++    AtomicInteger active = inFlight(request.getMethod(), known == null ? RouteTemplates.UNKNOWN : known);
++    active.incrementAndGet();
++    CountingRequest countingRequest = new CountingRequest(request);
++    CountingResponse countingResponse = new CountingResponse(response);
++    long begin = System.nanoTime();
++    try {
++      chain.doFilter(countingRequest, countingResponse);
++    } finally {
++      active.decrementAndGet();
++      long durationNanos = System.nanoTime() - begin;
++      int status = response.getStatus();
++      String uri = RouteTemplates.label(request, status);
++      long requestBytes = Math.max(countingRequest.bytesRead(), Math.max(0L, request.getContentLengthLong()));
++      long responseBytes = countingResponse.bytesWritten();
++      counter("http.server.request.bytes", "Request body bytes received per route.", uri).increment(requestBytes);
++      counter("http.server.response.bytes", "Response body bytes sent per route.", uri).increment(responseBytes);
++      if (accessLog) {
++        access.atInfo()
++            .addKeyValue("http.request.method", request.getMethod())
++            .addKeyValue("url.path", uri)
++            .addKeyValue("http.response.status_code", status)
++            .addKeyValue("event.duration", durationNanos)
++            .addKeyValue("http.request.bytes", requestBytes)
++            .addKeyValue("http.response.bytes", responseBytes)
++            .log("{} {} {}", request.getMethod(), uri, status);
++      }
++      MDC.remove(MDC_REQUEST_ID);
++    }
++  }
++
++  /** One gauge per (method, route) known at entry: bounded by the route table. */
++  private AtomicInteger inFlight(String method, String uri) {
++    String normalizedMethod = METHODS.contains(method) ? method : "OTHER";
++    return inFlight.computeIfAbsent(normalizedMethod + " " + uri, key -> {
++      AtomicInteger counter = new AtomicInteger();
++      Gauge.builder("http.server.requests.active", counter, AtomicInteger::get)
++          .description("Requests in flight per route (the route known when the request arrived).")
++          .tag("method", normalizedMethod).tag("uri", uri)
++          .register(registry);
++      return counter;
++    });
++  }
++
++  private Counter counter(String name, String description, String uri) {
++    return Counter.builder(name).description(description).baseUnit("bytes").tag("uri", uri)
++        .register(registry);
++  }
++
++  private static String requestId(HttpServletRequest request) {
++    String incoming = request.getHeader(REQUEST_ID_HEADER);
++    if (incoming != null && REQUEST_ID.matcher(incoming).matches()) {
++      return incoming;
++    }
++    return UUID.randomUUID().toString();
++  }
++
++  /** Counts the body bytes the application actually reads. */
++  private static final class CountingRequest extends HttpServletRequestWrapper {
++
++    private long bytes;
++    private ServletInputStream stream;
++
++    CountingRequest(HttpServletRequest request) {
++      super(request);
++    }
++
++    long bytesRead() {
++      return bytes;
++    }
++
++    @Override
++    public ServletInputStream getInputStream() throws IOException {
++      if (stream == null) {
++        ServletInputStream delegate = super.getInputStream();
++        stream = new ServletInputStream() {
++          @Override
++          public int read() throws IOException {
++            int value = delegate.read();
++            if (value >= 0) {
++              bytes++;
++            }
++            return value;
++          }
++
++          @Override
++          public int read(byte[] buffer, int offset, int length) throws IOException {
++            int count = delegate.read(buffer, offset, length);
++            if (count > 0) {
++              bytes += count;
++            }
++            return count;
++          }
++
++          @Override
++          public int available() throws IOException {
++            return delegate.available();
++          }
++
++          @Override
++          public void close() throws IOException {
++            delegate.close();
++          }
++
++          @Override
++          public boolean isFinished() {
++            return delegate.isFinished();
++          }
++
++          @Override
++          public boolean isReady() {
++            return delegate.isReady();
++          }
++
++          @Override
++          public void setReadListener(ReadListener listener) {
++            delegate.setReadListener(listener);
++          }
++        };
++      }
++      return stream;
++    }
++  }
++
++  /**
++   * Counts the body bytes the application writes (text written through the
++   * Writer API is counted in characters).
++   */
++  private static final class CountingResponse extends HttpServletResponseWrapper {
++
++    private long bytes;
++    private ServletOutputStream stream;
++    private PrintWriter writer;
++
++    CountingResponse(HttpServletResponse response) {
++      super(response);
++    }
++
++    long bytesWritten() {
++      return bytes;
++    }
++
++    @Override
++    public ServletOutputStream getOutputStream() throws IOException {
++      if (stream == null) {
++        ServletOutputStream delegate = super.getOutputStream();
++        stream = new ServletOutputStream() {
++          @Override
++          public void write(int value) throws IOException {
++            delegate.write(value);
++            bytes++;
++          }
++
++          @Override
++          public void write(byte[] buffer, int offset, int length) throws IOException {
++            delegate.write(buffer, offset, length);
++            bytes += length;
++          }
++
++          @Override
++          public void flush() throws IOException {
++            delegate.flush();
++          }
++
++          @Override
++          public void close() throws IOException {
++            delegate.close();
++          }
++
++          @Override
++          public boolean isReady() {
++            return delegate.isReady();
++          }
++
++          @Override
++          public void setWriteListener(WriteListener listener) {
++            delegate.setWriteListener(listener);
++          }
++        };
++      }
++      return stream;
++    }
++
++    @Override
++    public PrintWriter getWriter() throws IOException {
++      if (writer == null) {
++        PrintWriter delegate = super.getWriter();
++        writer = new PrintWriter(delegate, false) {
++          @Override
++          public void write(int value) {
++            super.write(value);
++            bytes++;
++          }
++
++          @Override
++          public void write(char[] buffer, int offset, int length) {
++            super.write(buffer, offset, length);
++            bytes += length;
++          }
++
++          @Override
++          public void write(String text, int offset, int length) {
++            super.write(text, offset, length);
++            bytes += length;
++          }
++        };
++      }
++      return writer;
++    }
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/RouteTemplates.java b/src/main/java/com/example/jwt/ops/RouteTemplates.java
+new file mode 100644
+index 0000000..4a907e9
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/RouteTemplates.java
+@@ -0,0 +1,94 @@
++package com.example.jwt.ops;
++
++import jakarta.servlet.http.HttpServletRequest;
++import java.util.Optional;
++import org.springframework.http.server.observation.ServerRequestObservationContext;
++import org.springframework.web.filter.ServerHttpObservationFilter;
++import org.springframework.web.servlet.HandlerMapping;
++import org.springframework.web.util.pattern.PathPattern;
++
++/**
++ * The route templates of the main listener as they appear in the {@code uri}
++ * label. Spring MVC records the matched pattern on the request observation for
++ * controller routes itself; the login route is served by the security filter
++ * chain and requests the security chain rejects never reach a handler, so the
++ * template of every known route is set up front. Anything else follows
++ * Micrometer's own fallbacks: {@code NOT_FOUND}, {@code REDIRECTION},
++ * {@code root}, {@code UNKNOWN}.
++ */
++public final class RouteTemplates {
++
++  public static final String UNKNOWN = "UNKNOWN";
++
++  private RouteTemplates() {}
++
++  /** The template of a known route for this method and path, or null. */
++  public static String match(String method, String path) {
++    switch (path) {
++      case "/users/login":
++        return "POST".equals(method) ? "/users/login" : null;
++      case "/users/register":
++        return "POST".equals(method) ? "/users/register" : null;
++      case "/users/me":
++        return "GET".equals(method) ? "/users/me" : null;
++      case "/users":
++        return "GET".equals(method) ? "/users" : null;
++      default:
++        break;
++    }
++    if (path.startsWith("/users/") && path.length() > 7 && path.indexOf('/', 7) < 0
++        && ("GET".equals(method) || "PUT".equals(method) || "DELETE".equals(method))) {
++      return "/users/{id}";
++    }
++    return null;
++  }
++
++  /** The servlet-relative request path. */
++  public static String path(HttpServletRequest request) {
++    String uri = request.getRequestURI();
++    String context = request.getContextPath();
++    if (context != null && !context.isEmpty() && uri.startsWith(context)) {
++      uri = uri.substring(context.length());
++    }
++    return uri.isEmpty() ? "/" : uri;
++  }
++
++  /** Records the template on the request observation Micrometer reads the uri label from. */
++  public static void announce(HttpServletRequest request, String template) {
++    Optional<ServerRequestObservationContext> context = ServerHttpObservationFilter.findObservationContext(request);
++    context.ifPresent(c -> c.setPathPattern(template));
++    request.setAttribute(RouteTemplates.class.getName(), template);
++  }
++
++  /**
++   * The {@code uri} label value after the request completed, identical to what
++   * Micrometer's server observation convention records: the pattern the
++   * handler mapping (or {@link #announce}) recorded, else a status-derived
++   * fallback.
++   */
++  public static String label(HttpServletRequest request, int status) {
++    String matched = ServerHttpObservationFilter.findObservationContext(request)
++        .map(ServerRequestObservationContext::getPathPattern)
++        .orElse(null);
++    if (matched == null) {
++      Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
++      if (pattern instanceof PathPattern pathPattern) {
++        matched = pathPattern.getPatternString();
++      } else if (pattern instanceof String string) {
++        matched = string;
++      } else if (request.getAttribute(RouteTemplates.class.getName()) instanceof String announced) {
++        matched = announced;
++      }
++    }
++    if (matched != null) {
++      return matched.isEmpty() ? "root" : matched;
++    }
++    if (status >= 300 && status < 400) {
++      return "REDIRECTION";
++    }
++    if (status == 404) {
++      return "NOT_FOUND";
++    }
++    return UNKNOWN;
 +  }
 +}
 diff --git a/src/main/java/com/example/jwt/ops/SignalShutdown.java b/src/main/java/com/example/jwt/ops/SignalShutdown.java
@@ -797,11 +1728,83 @@ index 0000000..545b115
 +    System.exit(exitCode);
 +  }
 +}
+diff --git a/src/main/java/com/example/jwt/ops/TomcatConnectorMetrics.java b/src/main/java/com/example/jwt/ops/TomcatConnectorMetrics.java
+new file mode 100644
+index 0000000..934d221
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/TomcatConnectorMetrics.java
+@@ -0,0 +1,60 @@
++package com.example.jwt.ops;
++
++import io.micrometer.core.instrument.Gauge;
++import io.micrometer.core.instrument.MeterRegistry;
++import java.util.concurrent.Executor;
++import java.util.function.ToDoubleFunction;
++import org.apache.catalina.connector.Connector;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.ProtocolHandler;
++import org.apache.tomcat.util.threads.ThreadPoolExecutor;
++
++/**
++ * Listener traffic read straight from the Tomcat connector (no JMX, so it
++ * works in the native image): the shared {@code http_server_connections_active}
++ * family every image serves, plus the connector families under Micrometer's
++ * Tomcat names and tags for the case that Micrometer's own MBean-based Tomcat
++ * binder could not register them (a family Micrometer already registered is
++ * left alone).
++ */
++public final class TomcatConnectorMetrics {
++
++  private TomcatConnectorMetrics() {}
++
++  public static void bind(MeterRegistry registry, Tomcat tomcat) {
++    for (Connector connector : tomcat.getService().findConnectors()) {
++      ProtocolHandler handler = connector.getProtocolHandler();
++      if (!(handler instanceof AbstractProtocol<?> protocol)) {
++        continue;
++      }
++      String name = protocol.getName().replace("\"", "");
++      Gauge.builder("http.server.connections.active", protocol, p -> p.getConnectionCount())
++          .description("Open connections on the listener, idle keep-alive connections included.")
++          .tag("listener", "main")
++          .register(registry);
++      gauge(registry, "tomcat.connections.current", "Current connections of the connector.",
++          "connections", name, protocol, p -> p.getConnectionCount());
++      gauge(registry, "tomcat.connections.config.max", "Configured maximum connections of the connector.",
++          "connections", name, protocol, p -> p.getMaxConnections());
++      Executor executor = protocol.getExecutor();
++      if (executor instanceof ThreadPoolExecutor pool) {
++        gauge(registry, "tomcat.threads.busy", "Request threads currently busy.",
++            "threads", name, pool, ThreadPoolExecutor::getActiveCount);
++        gauge(registry, "tomcat.threads.current", "Request threads currently alive.",
++            "threads", name, pool, ThreadPoolExecutor::getPoolSize);
++        gauge(registry, "tomcat.threads.config.max", "Configured maximum request threads.",
++            "threads", name, pool, ThreadPoolExecutor::getMaximumPoolSize);
++      }
++    }
++  }
++
++  private static <T> void gauge(MeterRegistry registry, String meter, String description,
++      String unit, String name, T subject, ToDoubleFunction<T> read) {
++    if (registry.find(meter).tag("name", name).gauge() != null) {
++      return;
++    }
++    Gauge.builder(meter, subject, read).description(description).baseUnit(unit).tag("name", name)
++        .register(registry);
++  }
++}
 diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
-index b15ef16..c379093 100644
+index b15ef16..a932796 100644
 --- a/src/main/resources/application.properties
 +++ b/src/main/resources/application.properties
-@@ -9,4 +9,9 @@ spring.jpa.properties.hibernate.format_sql=true
+@@ -4,9 +4,26 @@ spring.datasource.password=${SPRING_DATASOURCE_PASSWORD}
+ spring.datasource.driver-class-name=org.postgresql.Driver
+ 
+ spring.jpa.hibernate.ddl-auto=${SPRING_JPA_HIBERNATE_DDL_AUTO}
+-spring.jpa.show-sql=true
++spring.jpa.show-sql=false
+ spring.jpa.properties.hibernate.format_sql=true
  
  jwt.issuer=${JWT_ISSUER}
  jwt.secret=${JWT_SECRET}
@@ -813,3 +1816,15 @@ index b15ef16..c379093 100644
 +server.shutdown=graceful
 +spring.lifecycle.timeout-per-shutdown-phase=${SHUTDOWN_TIMEOUT:10}s
 +spring.main.banner-mode=off
++spring.web.resources.add-mappings=false
++management.endpoints.access.default=none
++management.health.defaults.enabled=false
++management.metrics.enable.disk=false
++management.metrics.distribution.percentiles-histogram.http.server.requests=true
++management.metrics.distribution.slo.http.server.requests=5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s,10s
++management.metrics.distribution.percentiles-histogram.spring.data.repository.invocations=true
++management.metrics.distribution.slo.spring.data.repository.invocations=5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s,10s
++management.metrics.enable.spring.security=false
++management.metrics.enable.jvm.compilation=false
++management.metrics.enable.process.cpu.time=false
++management.metrics.enable.system.cpu.usage=false
