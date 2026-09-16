@@ -9,7 +9,7 @@ The chart is the policy half of the container build standard: the images ship me
 (probe endpoints, env config surface, signal-driven drain, `/metrics`, JSON logs), this chart
 wires them into Kubernetes policy (probe scheduling, grace periods, mounts, services, secrets
 references, the admin/log interface settings). Everything is driven by one generic component model;
-the four default components are plain values entries, so a CD repo can override any field,
+the five default components are plain values entries, so a CD repo can override any field,
 disable any component, or add entirely new components without touching a template.
 
 ## Component model
@@ -126,8 +126,9 @@ do-block-storage supports it) — changing the value afterwards makes the sync f
 | Component | Image | Kind | Notes |
 |-----------|-------|------|-------|
 | db | postgresql:0.0.2 (PostgreSQL 16.15) | StatefulSet | PVC at `/var/lib/postgresql` (PGDATA is created beneath it by the supervisor); password read from the mounted secret key `db-password`; `filesMountPath` preset to `/docker-entrypoint-initdb.d`, so `files` entries run as first-init SQL; `pg_*` statistics on the admin port |
-| backend | user-mgmt-service:0.0.3 | Deployment | Wired to `<release>-db`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only); Micrometer route/JVM/pool metrics on the admin port |
+| backend | user-mgmt-service:0.0.4 | Deployment | Wired to `<release>-db` and, through `MODULE_SERVICE_URL`, to `<release>-modules:8080`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only); Micrometer route/JVM/pool metrics and the modules-hop client metrics on the admin port |
 | frontend | auth-portal:0.0.2 | Deployment | `API_URL` wired to `<release>-backend:8080`; route, backend-hop and connection metrics on the admin port, access log on by default |
+| modules | module-service:0.0.1 (module_service 0.1.0, compiled to a native binary) | Deployment | MySQL connection URL read from the mounted secret key `database-url` (`secretMount.keys` projects only that key); in-cluster only, no proxy route: the backend reaches it as `<release>-modules:8080`; route, database-hop and process metrics on the admin port |
 | proxy | traefik:0.0.3 (Traefik v3.7.13) | Deployment, Service type LoadBalancer (80→8080, 443→8443) | Routes via the file provider: `files.routes.yaml` ConfigMap mounted at `/etc/traefik/dynamic`, default router → frontend; `/data` is an emptyDir until `persistence.enabled` (required for ACME); Traefik's entrypoint/router/service metrics on container port 9101 (not on the Service) |
 
 ## What every deployment must supply
@@ -138,8 +139,18 @@ do-block-storage supports it) — changing the value afterwards makes the sync f
   global:
     existingSecret: app-credentials
   ```
-  Required keys: `db-password` (db + backend), `jwt-secret` (backend; Base64, ≥256-bit decoded).
+  Required keys: `db-password` (db + backend), `jwt-secret` (backend; Base64, ≥256-bit decoded),
+  `database-url` (modules; the managed MySQL as one URL,
+  `mysql+pymysql://<user>:<password>@<host>:<port>/<database>?charset=utf8mb4`).
   A component's own `existingSecret` overrides the global one.
+- **MySQL for the module service** — a database the operator manages (the stack ships no MySQL
+  image); apply the upstream `schema.sql` to it once (the service runs no migrations, its
+  `schema` health check stays red until the `modules` table exists). TLS defaults to
+  `MYSQL_SSL_MODE=preferred` (used when the server offers it, certificate not verified); for a
+  verified connection put the server CA under a secret key (e.g. `mysql-ca`) and set
+  `components.modules.env.MYSQL_SSL_MODE: verify-identity`,
+  `components.modules.env.MYSQL_SSL_CA: /run/secrets/mysql-ca` and
+  `components.modules.secretMount.keys: [database-url, mysql-ca]`.
 - **Registry credentials** — when the registry packages are private:
   `global.imagePullSecrets: [{name: <dockerconfig-secret>}]`.
 - **Authority seed SQL** — the backend never creates the `USER_MODIFY` / `USER_DELETE`
@@ -162,8 +173,8 @@ do-block-storage supports it) — changing the value afterwards makes the sync f
 CI validates the default and scaling renders with kubeconform against the Kubernetes schemas.
 Rendered manifests encode each
 image's documented requirements: probe endpoints on the admin port, stop grace periods derived
-from each image's drain (db 40 ≥ 40, backend/frontend 18 ≥ 15, proxy 23 ≥ 20), read-only
-rootfs, dropped capabilities, non-root fixed UIDs (10020–10023), tmpfs-style `/tmp`.
+from each image's drain (db 40 ≥ 40, backend/frontend/modules 18 ≥ 15, proxy 23 ≥ 20), read-only
+rootfs, dropped capabilities, non-root fixed UIDs (10020–10024), tmpfs-style `/tmp`.
 Not covered by rendering: the scrape itself (each image's `CONTRACT.md` lists what
 `/metrics` serves).
 
@@ -171,7 +182,7 @@ Not covered by rendering: the scrape itself (each image's `CONTRACT.md` lists wh
 
 ```
 helm package . --destination dist
-helm push dist/generic-stack-0.0.4.tgz oci://<registry>/charts
+helm push dist/generic-stack-0.0.5.tgz oci://<registry>/charts
 ```
 For this repository `<registry>` is `ghcr.io/beatos-learns/vsc-kubernetes-containers`; the
 CI workflow derives it from the repository name and overrides `global.imageRegistry` at

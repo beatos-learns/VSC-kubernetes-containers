@@ -389,7 +389,7 @@ jobs:
           REPO_LC=${GITHUB_REPOSITORY,,}
           sed -i "s|^  imageRegistry: .*|  imageRegistry: $REGISTRY/$REPO_LC|" values.yaml
           helm lint . --strict
-          base=(--set components.db.secret.db-password=x --set components.backend.secret.db-password=x --set components.backend.secret.jwt-secret=x)
+          base=(--set components.db.secret.db-password=x --set components.backend.secret.db-password=x --set components.backend.secret.jwt-secret=x --set components.modules.secret.database-url=x)
           kc=(kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" -schema-location default)
           helm template ci . "${base[@]}" | "${kc[@]}"
           helm template ci . "${base[@]}" \

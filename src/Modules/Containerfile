@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+ARG APP_UID=10024
+ARG APP_GID=10024
+ARG VERSION=0.1.0
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+ARG SOURCE_COMMIT=e86baa4aa0f0bc53b0685edbb05a1c3a8d4b9494
+ARG NUITKA_VERSION=4.2.1
+ARG PATCHELF_VERSION=0.19.1.0
+
+# ---------------------------------------------------------------------------
+FROM docker.io/library/alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS build
+ARG SOURCE_COMMIT
+ARG NUITKA_VERSION
+ARG PATCHELF_VERSION
+RUN apk upgrade --no-cache \
+ && apk add --no-cache python3 python3-dev gcc musl-dev binutils ccache git uv ca-certificates
+WORKDIR /src
+RUN git init -q . \
+ && git remote add origin https://github.com/yagan93/module_service.git \
+ && git fetch -q --depth 1 origin ${SOURCE_COMMIT} \
+ && git checkout -q FETCH_HEAD
+COPY patches/ /patches/
+RUN git apply /patches/*.patch
+ENV UV_PYTHON=/usr/bin/python3 \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_LINK_MODE=copy
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project \
+      --no-install-package watchfiles --no-install-package websockets \
+      --no-install-package pyyaml --no-install-package greenlet
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python .venv/bin/python nuitka==${NUITKA_VERSION} patchelf==${PATCHELF_VERSION}
+RUN --mount=type=cache,target=/root/.cache/Nuitka \
+    PATH=/src/.venv/bin:$PATH LDFLAGS=-Wl,--export-dynamic \
+    python -m nuitka --standalone --deployment --static-libpython=yes \
+      --python-flag=-m --output-dir=/out --output-filename=module-service --jobs="$(nproc)" \
+      --include-module=_json --include-module=_bisect \
+      --nofollow-import-to=pytest --nofollow-import-to=_pytest --nofollow-import-to=httpx \
+      --nofollow-import-to=watchfiles --nofollow-import-to=websockets --nofollow-import-to=wsproto \
+      --nofollow-import-to=yaml --nofollow-import-to=greenlet \
+      app
+COPY assemble.sh /assemble.sh
+RUN sh -eu /assemble.sh /out/app.dist
+
+# ---------------------------------------------------------------------------
+FROM scratch
+ARG APP_UID
+ARG APP_GID
+ARG VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="module-service" \
+      org.opencontainers.image.source="https://github.com/yagan93/module_service" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+COPY --from=build --chown=${APP_UID}:${APP_GID} /skel/ /
+COPY --from=build /lib/ld-musl-*.so.1 /lib/
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build --chown=${APP_UID}:${APP_GID} /out/app.dist/ /app/
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    APP_VERSION=${VERSION} \
+    APP_REVISION=${VCS_REF}
+USER ${APP_UID}:${APP_GID}
+EXPOSE 8080 9090
+ENTRYPOINT ["/app/module-service"]

@@ -1,0 +1,524 @@
+diff --git a/.env b/.env
+index 7ba08e3..a311e16 100644
+--- a/.env
++++ b/.env
+@@ -5,4 +5,6 @@ SPRING_JPA_HIBERNATE_DDL_AUTO=create
+ 
+ JWT_ISSUER=Spring
+ JWT_SECRET=wIDAQABAkAzGlFARFau7K0b9FcEwIDAQABAkAzGlFARFau7K0b9FcEwIDAQABAkAzGlFARFau7K0b9FcE
+-JWT_EXPIRATION_MILLIS=86400000
+\ No newline at end of file
++JWT_EXPIRATION_MILLIS=86400000
++
++MODULE_SERVICE_URL=http://localhost:8081
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index aeb1852..795dda5 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,20 @@
+ Spring 4.1 compliant app that demonstrates the authentication and authorization of a user via JWT
+ 
++## Modules
++
++Modules are managed by the [module service](https://github.com/yagan93/module_service). This
++service reaches it at `MODULE_SERVICE_URL` (required) with a connect and read timeout, retries and
++a circuit breaker; the optional knobs are `MODULE_SERVICE_CONNECT_TIMEOUT_MILLIS` (2000),
++`MODULE_SERVICE_READ_TIMEOUT_MILLIS` (3000), `MODULE_SERVICE_RETRY_MAX_ATTEMPTS` (3),
++`MODULE_SERVICE_RETRY_WAIT_MILLIS` (200) and
++`MODULE_SERVICE_CIRCUIT_BREAKER_WAIT_IN_OPEN_STATE_MILLIS` (10000).
++
++| Method   | Path                              | Authorization            | Status                          |
++|----------|-----------------------------------|--------------------------|---------------------------------|
++| `GET`    | `/modules`                        | authenticated            | `200`                           |
++| `POST`   | `/modules`                        | `USER_MODIFY`            | `201`, `409` duplicate code     |
++| `POST`   | `/users/{id}/modules/{moduleId}`  | own id or `USER_MODIFY`  | `200`, `404` unknown user/module |
++| `DELETE` | `/users/{id}/modules/{moduleId}`  | own id or `USER_MODIFY`  | `200`, `404` unknown user       |
++
++A module is assigned only after the module service confirmed it exists. When the module service
++does not answer or the circuit breaker is open, these endpoints respond `503`.
+diff --git a/build.gradle b/build.gradle
+index c561d45..d998130 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -28,6 +28,9 @@ dependencies {
+     implementation group: 'io.jsonwebtoken', name: 'jjwt-jackson', version: '0.13.0'
+     implementation group: 'org.mapstruct', name: 'mapstruct', version: '1.6.3'
+     implementation 'org.bouncycastle:bcprov-jdk18on:1.84'
++    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-restclient', version: '4.1.0-M3'
++    implementation group: 'io.github.resilience4j', name: 'resilience4j-circuitbreaker', version: '2.4.0'
++    implementation group: 'io.github.resilience4j', name: 'resilience4j-retry', version: '2.4.0'
+ 
+     annotationProcessor group: 'org.mapstruct', name: 'mapstruct-processor', version: '1.6.3'
+     annotationProcessor group: 'org.springframework.boot', name: 'spring-boot-configuration-processor', version: '4.1.0-M3'
+diff --git a/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java b/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
+index f3db50e..1dea44c 100644
+--- a/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
++++ b/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
+@@ -1,12 +1,20 @@
+ package com.example.jwt.core.exception;
+ 
++import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+ import java.time.LocalDate;
++import java.util.Map;
++import java.util.NoSuchElementException;
+ import java.util.stream.Collectors;
+ import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.MethodArgumentNotValidException;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.ResponseStatus;
+ import org.springframework.web.bind.annotation.RestControllerAdvice;
++import org.springframework.web.client.HttpClientErrorException;
++import org.springframework.web.client.HttpServerErrorException;
++import org.springframework.web.client.ResourceAccessException;
+ 
+ @RestControllerAdvice
+ public class CustomGlobalExceptionHandler {
+@@ -21,6 +29,27 @@ public class CustomGlobalExceptionHandler {
+         .build();
+   }
+ 
++  @ExceptionHandler(NoSuchElementException.class)
++  @ResponseStatus(value = HttpStatus.NOT_FOUND)
++  public ResponseError handleNoSuchElement(NoSuchElementException ex) {
++    return new ResponseError().setTimeStamp(LocalDate.now())
++        .setErrors(Map.of("id", ex.getMessage())).build();
++  }
++
++  @ExceptionHandler(HttpClientErrorException.class)
++  public ResponseEntity<String> handleModuleServiceClientError(HttpClientErrorException ex) {
++    return ResponseEntity.status(ex.getStatusCode()).contentType(MediaType.APPLICATION_JSON)
++        .body(ex.getResponseBodyAsString());
++  }
++
++  @ExceptionHandler({ResourceAccessException.class, HttpServerErrorException.class,
++      CallNotPermittedException.class})
++  @ResponseStatus(value = HttpStatus.SERVICE_UNAVAILABLE)
++  public ResponseError handleModuleServiceUnavailable(Exception ex) {
++    return new ResponseError().setTimeStamp(LocalDate.now())
++        .setErrors(Map.of("module", "module service unavailable")).build();
++  }
++
+ }
+ 
+ 
+diff --git a/src/main/java/com/example/jwt/domain/module/ModuleController.java b/src/main/java/com/example/jwt/domain/module/ModuleController.java
+new file mode 100644
+index 0000000..53cbd23
+--- /dev/null
++++ b/src/main/java/com/example/jwt/domain/module/ModuleController.java
+@@ -0,0 +1,36 @@
++package com.example.jwt.domain.module;
++
++import jakarta.validation.Valid;
++import java.util.List;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.access.prepost.PreAuthorize;
++import org.springframework.validation.annotation.Validated;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++@Validated
++@RestController
++@RequestMapping("/modules")
++public class ModuleController {
++
++  private final ModuleServiceClient moduleServiceClient;
++
++  public ModuleController(ModuleServiceClient moduleServiceClient) {
++    this.moduleServiceClient = moduleServiceClient;
++  }
++
++  @GetMapping({"", "/"})
++  public ResponseEntity<List<ModuleDTO>> retrieveAll() {
++    return ResponseEntity.ok(moduleServiceClient.findAll());
++  }
++
++  @PostMapping({"", "/"})
++  @PreAuthorize("hasAuthority('USER_MODIFY')")
++  public ResponseEntity<ModuleDTO> create(@Valid @RequestBody ModuleDTO moduleDTO) {
++    return ResponseEntity.status(HttpStatus.CREATED).body(moduleServiceClient.create(moduleDTO));
++  }
++}
+diff --git a/src/main/java/com/example/jwt/domain/module/ModuleDTO.java b/src/main/java/com/example/jwt/domain/module/ModuleDTO.java
+new file mode 100644
+index 0000000..2531c32
+--- /dev/null
++++ b/src/main/java/com/example/jwt/domain/module/ModuleDTO.java
+@@ -0,0 +1,9 @@
++package com.example.jwt.domain.module;
++
++import jakarta.validation.constraints.NotBlank;
++import java.util.UUID;
++
++public record ModuleDTO(UUID id, @NotBlank String code, @NotBlank String name,
++                        String description) {
++
++}
+diff --git a/src/main/java/com/example/jwt/domain/module/ModuleServiceClient.java b/src/main/java/com/example/jwt/domain/module/ModuleServiceClient.java
+new file mode 100644
+index 0000000..262209e
+--- /dev/null
++++ b/src/main/java/com/example/jwt/domain/module/ModuleServiceClient.java
+@@ -0,0 +1,66 @@
++package com.example.jwt.domain.module;
++
++import io.github.resilience4j.circuitbreaker.CircuitBreaker;
++import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
++import io.github.resilience4j.retry.Retry;
++import io.github.resilience4j.retry.RetryConfig;
++import java.net.http.HttpClient;
++import java.time.Duration;
++import java.util.List;
++import java.util.UUID;
++import java.util.function.Supplier;
++import org.springframework.boot.context.properties.EnableConfigurationProperties;
++import org.springframework.core.ParameterizedTypeReference;
++import org.springframework.http.client.JdkClientHttpRequestFactory;
++import org.springframework.stereotype.Component;
++import org.springframework.web.client.HttpClientErrorException;
++import org.springframework.web.client.RestClient;
++
++@Component
++@EnableConfigurationProperties(ModuleServiceProperties.class)
++public class ModuleServiceClient {
++
++  private final RestClient restClient;
++  private final Retry retry;
++  private final CircuitBreaker circuitBreaker;
++
++  public ModuleServiceClient(RestClient.Builder builder, ModuleServiceProperties properties) {
++    JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(
++        HttpClient.newBuilder()
++            .connectTimeout(Duration.ofMillis(properties.connectTimeoutMillis())).build());
++    requestFactory.setReadTimeout(Duration.ofMillis(properties.readTimeoutMillis()));
++    this.restClient = builder.baseUrl(properties.url()).requestFactory(requestFactory).build();
++    this.retry = Retry.of("module-service", RetryConfig.custom()
++        .maxAttempts(properties.retryMaxAttempts())
++        .waitDuration(Duration.ofMillis(properties.retryWaitMillis()))
++        .ignoreExceptions(HttpClientErrorException.class)
++        .build());
++    this.circuitBreaker = CircuitBreaker.of("module-service", CircuitBreakerConfig.custom()
++        .slidingWindowSize(10)
++        .minimumNumberOfCalls(5)
++        .waitDurationInOpenState(
++            Duration.ofMillis(properties.circuitBreakerWaitInOpenStateMillis()))
++        .ignoreExceptions(HttpClientErrorException.class)
++        .build());
++  }
++
++  public List<ModuleDTO> findAll() {
++    return call(() -> restClient.get().uri("/api/v1/modules").retrieve()
++        .body(new ParameterizedTypeReference<>() {
++        }));
++  }
++
++  public ModuleDTO findById(UUID id) {
++    return call(() -> restClient.get().uri("/api/v1/modules/{module_id}", id).retrieve()
++        .body(ModuleDTO.class));
++  }
++
++  public ModuleDTO create(ModuleDTO module) {
++    return call(() -> restClient.post().uri("/api/v1/modules").body(module).retrieve()
++        .body(ModuleDTO.class));
++  }
++
++  private <T> T call(Supplier<T> request) {
++    return circuitBreaker.decorateSupplier(retry.decorateSupplier(request)).get();
++  }
++}
+diff --git a/src/main/java/com/example/jwt/domain/module/ModuleServiceProperties.java b/src/main/java/com/example/jwt/domain/module/ModuleServiceProperties.java
+new file mode 100644
+index 0000000..fadf9c8
+--- /dev/null
++++ b/src/main/java/com/example/jwt/domain/module/ModuleServiceProperties.java
+@@ -0,0 +1,17 @@
++package com.example.jwt.domain.module;
++
++import jakarta.validation.constraints.NotBlank;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++import org.springframework.validation.annotation.Validated;
++
++@Validated
++@ConfigurationProperties("module-service")
++public record ModuleServiceProperties(@NotBlank String url,
++                                      @DefaultValue("2000") long connectTimeoutMillis,
++                                      @DefaultValue("3000") long readTimeoutMillis,
++                                      @DefaultValue("3") int retryMaxAttempts,
++                                      @DefaultValue("200") long retryWaitMillis,
++                                      @DefaultValue("10000") long circuitBreakerWaitInOpenStateMillis) {
++
++}
+diff --git a/src/main/java/com/example/jwt/domain/user/User.java b/src/main/java/com/example/jwt/domain/user/User.java
+index 3068954..6be12ca 100644
+--- a/src/main/java/com/example/jwt/domain/user/User.java
++++ b/src/main/java/com/example/jwt/domain/user/User.java
+@@ -2,7 +2,9 @@ package com.example.jwt.domain.user;
+ 
+ import com.example.jwt.core.generic.ExtendedAuditEntity;
+ import com.example.jwt.domain.role.Role;
++import jakarta.persistence.CollectionTable;
+ import jakarta.persistence.Column;
++import jakarta.persistence.ElementCollection;
+ import jakarta.persistence.Entity;
+ import jakarta.persistence.FetchType;
+ import jakarta.persistence.JoinColumn;
+@@ -12,6 +14,8 @@ import jakarta.persistence.Table;
+ import java.util.HashSet;
+ import java.util.Set;
+ import java.util.UUID;
++import org.hibernate.annotations.Fetch;
++import org.hibernate.annotations.FetchMode;
+ 
+ @Entity
+ @Table(name = "users")
+@@ -37,6 +41,12 @@ public class User extends ExtendedAuditEntity {
+   )
+   private Set<Role> roles = new HashSet<>();
+ 
++  @ElementCollection(fetch = FetchType.EAGER)
++  @Fetch(FetchMode.SELECT)
++  @CollectionTable(name = "users_module", joinColumns = @JoinColumn(name = "users_id"))
++  @Column(name = "module_id")
++  private Set<UUID> moduleIds = new HashSet<>();
++
+   public User() {
+   }
+ 
+@@ -94,4 +104,13 @@ public class User extends ExtendedAuditEntity {
+     this.roles = roles;
+     return this;
+   }
++
++  public Set<UUID> getModuleIds() {
++    return moduleIds;
++  }
++
++  public User setModuleIds(Set<UUID> moduleIds) {
++    this.moduleIds = moduleIds;
++    return this;
++  }
+ }
+diff --git a/src/main/java/com/example/jwt/domain/user/UserController.java b/src/main/java/com/example/jwt/domain/user/UserController.java
+index c88e516..397f18a 100644
+--- a/src/main/java/com/example/jwt/domain/user/UserController.java
++++ b/src/main/java/com/example/jwt/domain/user/UserController.java
+@@ -70,4 +70,18 @@ public class UserController {
+     userService.deleteById(id);
+     return ResponseEntity.noContent().build();
+   }
++
++  @PostMapping("/{id}/modules/{moduleId}")
++  @PreAuthorize("#id == authentication.principal.user.id || hasAuthority('USER_MODIFY')")
++  public ResponseEntity<UserDTO> assignModule(@PathVariable UUID id,
++      @PathVariable UUID moduleId) {
++    return ResponseEntity.ok(userMapper.toDTO(userService.assignModule(id, moduleId)));
++  }
++
++  @DeleteMapping("/{id}/modules/{moduleId}")
++  @PreAuthorize("#id == authentication.principal.user.id || hasAuthority('USER_MODIFY')")
++  public ResponseEntity<UserDTO> unassignModule(@PathVariable UUID id,
++      @PathVariable UUID moduleId) {
++    return ResponseEntity.ok(userMapper.toDTO(userService.unassignModule(id, moduleId)));
++  }
+ }
+diff --git a/src/main/java/com/example/jwt/domain/user/UserService.java b/src/main/java/com/example/jwt/domain/user/UserService.java
+index ebb743d..251c831 100644
+--- a/src/main/java/com/example/jwt/domain/user/UserService.java
++++ b/src/main/java/com/example/jwt/domain/user/UserService.java
+@@ -1,9 +1,14 @@
+ package com.example.jwt.domain.user;
+ 
+ import com.example.jwt.core.generic.ExtendedService;
++import java.util.UUID;
+ import org.springframework.security.core.userdetails.UserDetailsService;
+ 
+ public interface UserService extends UserDetailsService, ExtendedService<User> {
+ 
+   User register(User user);
++
++  User assignModule(UUID id, UUID moduleId);
++
++  User unassignModule(UUID id, UUID moduleId);
+ }
+diff --git a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+index 60fffa5..2cde2b2 100644
+--- a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
++++ b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+@@ -1,6 +1,8 @@
+ package com.example.jwt.domain.user;
+ 
+ import com.example.jwt.core.generic.ExtendedServiceImpl;
++import com.example.jwt.domain.module.ModuleServiceClient;
++import java.util.UUID;
+ import org.slf4j.Logger;
+ import org.springframework.security.core.userdetails.UserDetails;
+ import org.springframework.security.core.userdetails.UsernameNotFoundException;
+@@ -11,11 +13,13 @@ import org.springframework.stereotype.Service;
+ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserService {
+ 
+   private final PasswordEncoder passwordEncoder;
++  private final ModuleServiceClient moduleServiceClient;
+ 
+   public UserServiceImpl(UserRepository repository, Logger logger,
+-      PasswordEncoder passwordEncoder) {
++      PasswordEncoder passwordEncoder, ModuleServiceClient moduleServiceClient) {
+     super(repository, logger);
+     this.passwordEncoder = passwordEncoder;
++    this.moduleServiceClient = moduleServiceClient;
+   }
+ 
+   @Override
+@@ -29,4 +33,25 @@ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserSe
+     user.setPassword(passwordEncoder.encode(user.getPassword()));
+     return save(user);
+   }
++
++  @Override
++  public User updateById(UUID id, User user) {
++    user.setModuleIds(findById(id).getModuleIds());
++    return super.updateById(id, user);
++  }
++
++  @Override
++  public User assignModule(UUID id, UUID moduleId) {
++    User user = findById(id);
++    moduleServiceClient.findById(moduleId);
++    user.getModuleIds().add(moduleId);
++    return save(user);
++  }
++
++  @Override
++  public User unassignModule(UUID id, UUID moduleId) {
++    User user = findById(id);
++    user.getModuleIds().remove(moduleId);
++    return save(user);
++  }
+ }
+diff --git a/src/main/java/com/example/jwt/domain/user/dto/UserDTO.java b/src/main/java/com/example/jwt/domain/user/dto/UserDTO.java
+index 8212a7c..65a7c8e 100644
+--- a/src/main/java/com/example/jwt/domain/user/dto/UserDTO.java
++++ b/src/main/java/com/example/jwt/domain/user/dto/UserDTO.java
+@@ -19,6 +19,8 @@ public class UserDTO extends ExtendedDTO {
+   @Valid
+   private Set<RoleDTO> roles;
+ 
++  private Set<UUID> moduleIds;
++
+   public UserDTO() {
+   }
+ 
+@@ -65,4 +67,13 @@ public class UserDTO extends ExtendedDTO {
+     this.roles = roles;
+     return this;
+   }
++
++  public Set<UUID> getModuleIds() {
++    return moduleIds;
++  }
++
++  public UserDTO setModuleIds(Set<UUID> moduleIds) {
++    this.moduleIds = moduleIds;
++    return this;
++  }
+ }
+diff --git a/src/test/java/com/example/jwt/domain/module/ModuleServiceClientTest.java b/src/test/java/com/example/jwt/domain/module/ModuleServiceClientTest.java
+new file mode 100644
+index 0000000..245c29e
+--- /dev/null
++++ b/src/test/java/com/example/jwt/domain/module/ModuleServiceClientTest.java
+@@ -0,0 +1,87 @@
++package com.example.jwt.domain.module;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.sun.net.httpserver.HttpServer;
++import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.client.HttpClientErrorException;
++import org.springframework.web.client.HttpServerErrorException;
++import org.springframework.web.client.RestClient;
++
++class ModuleServiceClientTest {
++
++  private final UUID id = UUID.randomUUID();
++  private final String module =
++      "{\"id\":\"" + id + "\",\"code\":\"CLOUD-ARCH\",\"name\":\"Cloud Architecture\"}";
++  private final Deque<Integer> statuses = new ArrayDeque<>();
++  private final AtomicInteger requests = new AtomicInteger();
++  private HttpServer server;
++  private ModuleServiceClient client;
++
++  @BeforeEach
++  void start() throws IOException {
++    server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++    server.createContext("/", exchange -> {
++      requests.incrementAndGet();
++      int status = statuses.isEmpty() ? 500 : statuses.poll();
++      byte[] body = status == 200 ? module.getBytes(StandardCharsets.UTF_8) : new byte[0];
++      exchange.getResponseHeaders().add("Content-Type", "application/json");
++      exchange.sendResponseHeaders(status, body.length == 0 ? -1 : body.length);
++      try (OutputStream out = exchange.getResponseBody()) {
++        out.write(body);
++      }
++    });
++    server.start();
++    client = new ModuleServiceClient(RestClient.builder(), new ModuleServiceProperties(
++        "http://127.0.0.1:" + server.getAddress().getPort(), 1000, 1000, 3, 1, 60000));
++  }
++
++  @AfterEach
++  void stop() {
++    server.stop(0);
++  }
++
++  @Test
++  void findsModuleById() {
++    statuses.add(200);
++    assertThat(client.findById(id).code()).isEqualTo("CLOUD-ARCH");
++    assertThat(requests.get()).isEqualTo(1);
++  }
++
++  @Test
++  void doesNotRetryClientErrors() {
++    statuses.add(404);
++    assertThatThrownBy(() -> client.findById(id))
++        .isInstanceOf(HttpClientErrorException.NotFound.class);
++    assertThat(requests.get()).isEqualTo(1);
++  }
++
++  @Test
++  void retriesServerErrors() {
++    statuses.addAll(List.of(500, 500, 200));
++    assertThat(client.findById(id).id()).isEqualTo(id);
++    assertThat(requests.get()).isEqualTo(3);
++  }
++
++  @Test
++  void opensCircuitAfterRepeatedFailures() {
++    for (int i = 0; i < 5; i++) {
++      assertThatThrownBy(client::findAll).isInstanceOf(HttpServerErrorException.class);
++    }
++    assertThatThrownBy(client::findAll).isInstanceOf(CallNotPermittedException.class);
++    assertThat(requests.get()).isEqualTo(15);
++  }
++}

@@ -25,6 +25,20 @@
     },
     {
       "customType": "regex",
+      "fileMatch": ["^src/[^/]+/Containerfile$"],
+      "matchStrings": ["ARG NUITKA_VERSION=(?<currentValue>[0-9][0-9.]*)"],
+      "depNameTemplate": "nuitka",
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^src/[^/]+/Containerfile$"],
+      "matchStrings": ["ARG PATCHELF_VERSION=(?<currentValue>[0-9][0-9.]*)"],
+      "depNameTemplate": "patchelf",
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "customType": "regex",
       "fileMatch": ["^\\.github/workflows/.+\\.ya?ml$"],
       "matchStrings": ["TRIVY_VERSION: (?<currentValue>[0-9][0-9.]*)"],
       "depNameTemplate": "aquasecurity/trivy",

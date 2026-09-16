@@ -4,6 +4,8 @@ Container build definitions, a generic Helm chart, and a CI pipeline for a small
 authentication stack:
 * a Spring Boot user-management API (GraalVM native)
 * a Next.js auth-portal
+* a FastAPI module service (Python compiled to a native binary with Nuitka), backed by a
+  MySQL the operator manages
 * PostgreSQL
 * Traefik
 
@@ -45,8 +47,9 @@ is all specified there.
 | src/DB | postgresql | 0.0.2 | PostgreSQL 16.15 | 10020 |
 | src/Frontend | auth-portal | 0.0.2 | auth_portal 0.1.0 (static export + Go server) | 10022 |
 | src/Frontend-node | auth-portal | 0.0.2-node | auth_portal 0.1.0 (Node.js runtime variant) | 10022 |
+| src/Modules | module-service | 0.0.1 | module_service 0.1.0 (Nuitka native build, musl, scratch) | 10024 |
 | src/Proxy | traefik | 0.0.3 | Traefik v3.7.13 | 10023 |
-| src/charts/generic-stack | charts/generic-stack | 0.0.4 | — | — |
+| src/charts/generic-stack | charts/generic-stack | 0.0.5 | — | — |
 
 * The **tag is the artifact version** (this repo's build)
 * the **OCI `image.version` label is the packaged software's version**
@@ -95,10 +98,11 @@ without a join.
 | `supervisor_child_up`, `supervisor_child_start_time_seconds` | gauge | — | split layouts only (db, proxy): the supervised child process |
 
 Plus the runtime of the language: `jvm_*` and `process_*` (backend), `go_*` and `process_*`
-(the Go supervisors and the frontend server), `nodejs_*` and `process_*` (node variant). The
-baseline is served from the moment the admin listener is up, before the application is ready.
+(the Go supervisors and the frontend server), `nodejs_*` and `process_*` (node variant),
+`python_*` and `process_*` (modules). The baseline is served from the moment the admin listener
+is up, before the application is ready.
 
-### Routes (every HTTP server: backend, frontend, frontend-node; Traefik has its own)
+### Routes (every HTTP server: backend, frontend, frontend-node, modules; Traefik has its own)
 
 | Family | Type | Labels | Enables |
 |---|---|---|---|
@@ -107,8 +111,11 @@ baseline is served from the moment the admin listener is up, before the applicat
 | `http_server_request_bytes_total`, `http_server_response_bytes_total` | counter | `uri` | traffic volume per route |
 
 `uri` is always a route template, never the raw path: the backend's `/users/register`,
-`/users/login`, `/users/me`, `/users`, `/users/{id}`; the frontend's `/`, `/login`, `/signup`,
-`/dashboard`, `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/static/**`. Anything that
+`/users/login`, `/users/me`, `/users`, `/users/{id}`, `/users/{id}/modules/{moduleId}`,
+`/modules`; the frontend's `/`, `/login`, `/signup`,
+`/dashboard`, `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/static/**`; the module
+service's `/api/v1/modules`, `/api/v1/modules/{module_id}`, `/openapi.json`, `/docs`,
+`/docs/oauth2-redirect`, `/redoc`. Anything that
 matches no route is `UNKNOWN` (the backend uses Micrometer's own `NOT_FOUND` / `REDIRECTION` /
 `root` for the same purpose), so a scan cannot create series. `outcome` is Micrometer's
 enumeration (`INFORMATIONAL`, `SUCCESS`, `REDIRECTION`, `CLIENT_ERROR`, `SERVER_ERROR`,
@@ -121,19 +128,21 @@ enumeration (`INFORMATIONAL`, `SUCCESS`, `REDIRECTION`, `CLIENT_ERROR`, `SERVER_
 |---|---|---|
 | Traefik -> frontend | `traefik_service_requests_total`, `traefik_service_request_duration_seconds_*`, `traefik_service_requests_bytes_total`, `traefik_service_responses_bytes_total` | `service`, `code`, `method`, `protocol` (Traefik's own, on the proxy's port 9101) |
 | frontend -> backend | `http_client_requests_seconds_{count,sum,bucket}`, `http_client_requests_active`, `http_client_request_bytes_total`, `http_client_response_bytes_total` | `peer` (= `backend`), `method`, `uri` (the backend's route template), `status`, `outcome` |
+| backend -> modules | `http_client_requests_seconds_{count,sum,bucket}`, `http_client_requests_active`, `http_client_request_bytes_total`, `http_client_response_bytes_total` | `peer` (= `modules`), `method`, `uri` (the module service's route template), `status`, `outcome` (Micrometer's RestClient observation relabelled; see `src/Backend/CONTRACT.md`) |
 | backend -> database | `hikaricp_connections_{active,idle,pending}`, `hikaricp_connections_acquire_seconds_*`, `hikaricp_connections_usage_seconds_*`, `hikaricp_connections_timeout_total`, `spring_data_repository_invocations_seconds_*` (`repository`, `method`, `state`) | Micrometer's own |
+| modules -> MySQL | `db_client_statements_seconds_{count,sum,bucket}` (`operation` = `select`/`insert`/`update`/`delete`/`other`, shared buckets), `db_client_statement_errors_total` (`operation`), `db_pool_connections` (`state` = `checked_out`/`idle`/`overflow`), `db_pool_size` | SQLAlchemy cursor events and pool state (see `src/Modules/CONTRACT.md`) |
 | database | `pg_up`, `pg_stat_database_*` (`numbackends`, `xact_commit_total`, `xact_rollback_total`, `blks_hit_total`, `blks_read_total`, `tup_{fetched,inserted,updated,deleted}_total`, `deadlocks_total`), `pg_database_size_bytes`, `pg_stat_activity_backends`, `pg_settings_max_connections`, `pg_locks` (see `src/DB/CONTRACT.md`; `_count` suffixes are reserved for histograms, which `promtool` enforces) | `datname`, `state`, `mode` |
 
-`peer` is the logical component name from the chart (`backend`, `frontend`, `db`), never a host
+`peer` is the logical component name from the chart (`backend`, `modules`, `db`), never a host
 or an IP. With `job` on the server side and `peer` on the client side of every hop, a per-hop
-table (rate, p95, error share) and a node graph edge -> frontend -> backend -> db need no extra
-joins.
+table (rate, p95, error share) and a node graph edge -> frontend -> backend -> modules / db need
+no extra joins.
 
 ### Traffic (every listener)
 
 | Family | Type | Labels | Where |
 |---|---|---|---|
-| `http_server_connections_active` | gauge | `listener` (`main`, `admin`) | Go and Node servers via the connection-state hook; the backend reads its `main` listener from the Tomcat connector (and serves the `tomcat_connections_*` families beside it) |
+| `http_server_connections_active` | gauge | `listener` (`main`, `admin`) | Go and Node servers via the connection-state hook; the module service from its two uvicorn listeners; the backend reads its `main` listener from the Tomcat connector (and serves the `tomcat_connections_*` families beside it) |
 | `traefik_entrypoint_requests_total`, `traefik_entrypoint_requests_bytes_total`, `traefik_entrypoint_responses_bytes_total`, `traefik_open_connections` | Traefik | `entrypoint`, `code`, `method`, `protocol` | proxy, port 9101 |
 | `traefik_router_requests_total`, `traefik_router_request_duration_seconds_*` | Traefik | `router`, `service`, `code`, `method`, `protocol` | proxy, port 9101: the routes as the edge sees them |
 
@@ -155,10 +164,10 @@ sets them for every component at once. Third-party children keep their own shape
 stderr lines with a fixed prefix, Traefik's JSON, Next.js's startup lines) — the contracts say
 which.
 
-The request id is the correlation key across proxy, frontend and backend: `X-Request-Id` is
-kept when the client sends a well-formed one, generated at the frontend otherwise, forwarded to
-the backend, echoed in every response, kept in Traefik's access log, and logged as
-`http.request.id`.
+The request id is the correlation key across proxy, frontend, backend and module service:
+`X-Request-Id` is kept when the client sends a well-formed one, generated at the frontend
+otherwise, forwarded to the backend (and by the backend to the module service), echoed in every
+response, kept in Traefik's access log, and logged as `http.request.id`.
 
 Access logs (`ACCESS_LOG`, `TRAEFIK_ACCESSLOG` for the proxy) are JSON, one line per request on
 the main listener, never for probe or metrics hits: `http.request.id`, `http.request.method`,
@@ -176,13 +185,15 @@ deep-merged over `componentDefaults`, so CD repositories control everything thro
 override any field, disable a component, or add new components without touching a template.
 Values are validated by `values.schema.json`; per-component `hpa:` / `pdb:` add scaling
 policy. The default components wire
-the full stack (Traefik file-provider routes → frontend → backend → db) and encode every
+the full stack (Traefik file-provider routes → frontend → backend → db, plus the in-cluster
+module service the backend calls) and encode every
 image contract's probe endpoints, grace periods, and security posture. `templates/monitoring.yaml`
 configures the admin and log interface of every container from one `monitoring` block (ports,
 health checker, drain sequence, `LOG_LEVEL` / `LOG_FORMAT` / `ACCESS_LOG`); probe periods and
 grace periods are derived from the same values. Scraping, alerting and dashboards are deployment
 policy. What each deployment must supply (one Secret, registry credentials, the authority seed
-SQL, storage, exposure, scraping) is listed in the chart's `CONTRACT.md`.
+SQL, the managed MySQL and its schema, storage, exposure, scraping) is listed in the chart's
+`CONTRACT.md`.
 
 ## CI
 

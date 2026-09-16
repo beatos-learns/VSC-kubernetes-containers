@@ -220,7 +220,7 @@ components:
   backend:
     image:
       repository: user-mgmt-service
-      tag: "0.0.3"
+      tag: "0.0.4"
     security:
       uid: 10021
       gid: 10021
@@ -236,6 +236,7 @@ components:
       SPRING_JPA_HIBERNATE_DDL_AUTO: update
       JWT_ISSUER: user-mgmt-service
       JWT_EXPIRATION_MILLIS: "3600000"
+      MODULE_SERVICE_URL: 'http://{{ include "generic-stack.componentName" (dict "root" . "name" "modules") }}:{{ .Values.components.modules.ports.main.servicePort }}'
     secretEnv:
       SPRING_DATASOURCE_PASSWORD: db-password
       JWT_SECRET: jwt-secret
@@ -255,6 +256,26 @@ components:
         protocol: TCP
     env:
       API_URL: 'http://{{ include "generic-stack.componentName" (dict "root" . "name" "backend") }}:{{ .Values.components.backend.ports.main.servicePort }}'
+
+  modules:
+    image:
+      repository: module-service
+      tag: "0.0.1"
+    security:
+      uid: 10024
+      gid: 10024
+    ports:
+      main:
+        name: http
+        containerPort: 8080
+        servicePort: 8080
+        protocol: TCP
+    env:
+      DATABASE_URL_FILE: /run/secrets/database-url
+    secretMount:
+      enabled: true
+      keys:
+        - database-url
 
   proxy:
     image:

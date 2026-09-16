@@ -1,0 +1,1717 @@
+diff --git a/app/__main__.py b/app/__main__.py
+new file mode 100644
+index 0000000..4635fdd
+--- /dev/null
++++ b/app/__main__.py
+@@ -0,0 +1,24 @@
++"""Entry point of the image: the service itself, or the exec-style probe command."""
++
++import sys
++
++
++def _main() -> int:
++    argv = sys.argv[1:]
++    if argv and argv[0] == "healthcheck":
++        from app.ops.probe import main as probe_main
++
++        return probe_main(argv[1:])
++    if argv:
++        print(
++            f"unknown arguments {argv!r}; usage: module-service [healthcheck --endpoint=<name>]",
++            file=sys.stderr,
++        )
++        return 2
++    from app.ops.server import main as server_main
++
++    return server_main()
++
++
++if __name__ == "__main__":
++    sys.exit(_main())
+diff --git a/app/config.py b/app/config.py
+index f94d4c6..2a4b33a 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -1,7 +1,20 @@
++from enum import StrEnum
+ from functools import lru_cache
++from pathlib import Path
+ 
++from pydantic import Field, model_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
++DATABASE_URL_SCHEMES = ("mysql+pymysql://", "sqlite://")
++
++
++class MysqlSslMode(StrEnum):
++    DISABLED = "disabled"
++    PREFERRED = "preferred"
++    REQUIRED = "required"
++    VERIFY_CA = "verify-ca"
++    VERIFY_IDENTITY = "verify-identity"
++
+ 
+ class Settings(BaseSettings):
+     model_config = SettingsConfigDict(
+@@ -11,10 +24,40 @@ class Settings(BaseSettings):
+     )
+ 
+     app_version: str = "0.1.0"
+-    log_level: str = "INFO"
+-    database_url: str
+-    mysql_ssl_disabled: bool = True
++    database_url: str | None = None
++    database_url_file: Path | None = None
++    mysql_ssl_mode: MysqlSslMode = MysqlSslMode.PREFERRED
++    mysql_ssl_ca: Path | None = None
++    db_connect_timeout: int = Field(default=5, ge=1, le=600)
++    db_pool_size: int = Field(default=5, ge=1, le=1000)
++    db_pool_max_overflow: int = Field(default=10, ge=0, le=1000)
++    db_pool_recycle: int = Field(default=300, ge=-1, le=86400)
++
++    @model_validator(mode="after")
++    def resolve(self) -> "Settings":
++        if self.database_url_file is not None:
++            path = self.database_url_file
++            try:
++                content = path.read_text(encoding="utf-8").strip()
++            except OSError as exc:
++                raise ValueError(f"DATABASE_URL_FILE {path}: {exc.strerror}") from exc
++            if not content:
++                raise ValueError(f"DATABASE_URL_FILE {path} is empty")
++            self.database_url = content
++        if not self.database_url:
++            raise ValueError("DATABASE_URL or DATABASE_URL_FILE is required")
++        if not self.database_url.startswith(DATABASE_URL_SCHEMES):
++            schemes = ", ".join(DATABASE_URL_SCHEMES)
++            raise ValueError(f"DATABASE_URL must start with one of {schemes}")
++        if self.mysql_ssl_mode in (MysqlSslMode.VERIFY_CA, MysqlSslMode.VERIFY_IDENTITY):
++            if self.mysql_ssl_ca is None:
++                mode = self.mysql_ssl_mode.value
++                raise ValueError(f"MYSQL_SSL_MODE={mode} requires MYSQL_SSL_CA")
++            if not self.mysql_ssl_ca.is_file():
++                raise ValueError(f"MYSQL_SSL_CA {self.mysql_ssl_ca} is not a readable file")
++        return self
++
+ 
+ @lru_cache
+ def get_settings() -> Settings:
+-    return Settings()
+\ No newline at end of file
++    return Settings()
+diff --git a/app/database.py b/app/database.py
+index f4db963..7ec2436 100644
+--- a/app/database.py
++++ b/app/database.py
+@@ -1,31 +1,55 @@
++import ssl
+ from collections.abc import Generator
++from typing import Any
+ 
+ from sqlalchemy import create_engine
+ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+ 
+-from app.config import get_settings
++from app.config import MysqlSslMode, Settings, get_settings
+ 
+ 
+ class Base(DeclarativeBase):
+     pass
+ 
+ 
+-def _connect_args() -> dict[str, object]:
++def _mysql_tls_args(settings: Settings) -> dict[str, Any]:
++    mode = settings.mysql_ssl_mode
++    if mode is MysqlSslMode.DISABLED:
++        return {"ssl_disabled": True}
++    if mode is MysqlSslMode.PREFERRED:
++        return {"ssl_disabled": False}
++    if mode is MysqlSslMode.REQUIRED:
++        context = ssl.create_default_context()
++        context.check_hostname = False
++        context.verify_mode = ssl.CERT_NONE
++        return {"ssl": context}
++    return {
++        "ssl_ca": str(settings.mysql_ssl_ca),
++        "ssl_verify_cert": True,
++        "ssl_verify_identity": mode is MysqlSslMode.VERIFY_IDENTITY,
++    }
++
++
++def _connect_args() -> dict[str, Any]:
+     settings = get_settings()
+     if settings.database_url.startswith("mysql"):
+-        return {"ssl_disabled": settings.mysql_ssl_disabled}
++        return {"connect_timeout": settings.db_connect_timeout, **_mysql_tls_args(settings)}
+     if settings.database_url.startswith("sqlite"):
+         return {"check_same_thread": False}
+     return {}
+ 
+ 
++def _engine_kwargs() -> dict[str, Any]:
++    settings = get_settings()
++    kwargs: dict[str, Any] = {"pool_pre_ping": True, "pool_recycle": settings.db_pool_recycle}
++    if settings.database_url.startswith("mysql"):
++        kwargs["pool_size"] = settings.db_pool_size
++        kwargs["max_overflow"] = settings.db_pool_max_overflow
++    return kwargs
++
++
+ settings = get_settings()
+-engine = create_engine(
+-    settings.database_url,
+-    connect_args=_connect_args(),
+-    pool_pre_ping=True,
+-    pool_recycle=300,
+-)
++engine = create_engine(settings.database_url, connect_args=_connect_args(), **_engine_kwargs())
+ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+ 
+ 
+@@ -34,4 +58,4 @@ def get_db() -> Generator[Session, None, None]:
+     try:
+         yield db
+     finally:
+-        db.close()
+\ No newline at end of file
++        db.close()
+diff --git a/app/main.py b/app/main.py
+index ed8a21f..37d7889 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,5 +1,3 @@
+-import logging
+-
+ from fastapi import FastAPI, HTTPException, Request
+ from fastapi.responses import JSONResponse
+ 
+@@ -7,9 +5,6 @@ from app.api import router
+ from app.config import get_settings
+ 
+ settings = get_settings()
+-logging.basicConfig(
+-    level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+-)
+ 
+ app = FastAPI(
+     title="Module Service",
+@@ -24,4 +19,4 @@ async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse
+     detail = exc.detail
+     if not isinstance(detail, dict) or "code" not in detail:
+         detail = {"code": "HTTP_ERROR", "message": str(detail)}
+-    return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
+\ No newline at end of file
++    return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
+diff --git a/app/ops/__init__.py b/app/ops/__init__.py
+new file mode 100644
+index 0000000..082330b
+--- /dev/null
++++ b/app/ops/__init__.py
+@@ -0,0 +1 @@
++"""Operational layer of the container image: probes, health checker, metrics, logs, drain."""
+diff --git a/app/ops/admin.py b/app/ops/admin.py
+new file mode 100644
+index 0000000..11381b2
+--- /dev/null
++++ b/app/ops/admin.py
+@@ -0,0 +1,68 @@
++"""The admin listener: probe endpoints over the cached snapshot, and the OpenMetrics exposition."""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Awaitable, Callable
++from typing import Any
++from urllib.parse import parse_qs
++
++from app.ops.health import HealthState
++from app.ops.metrics import CONTENT_TYPE, Registry
++
++Scope = dict[str, Any]
++Message = dict[str, Any]
++Receive = Callable[[], Awaitable[Message]]
++Send = Callable[[Message], Awaitable[None]]
++
++TEXT = "text/plain; charset=utf-8"
++JSON = "application/json"
++
++
++class AdminApp:
++    def __init__(self, state: HealthState, registry: Registry) -> None:
++        self.state = state
++        self.registry = registry
++        self.probes: dict[str, Callable[[], bool]] = {
++            "/startupz": lambda: self.state.started,
++            "/livez": self.state.fresh,
++            "/readyz": self.state.ready,
++        }
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] != "http":
++            return
++        method = str(scope.get("method", ""))
++        path = str(scope.get("path", ""))
++        if method not in ("GET", "HEAD"):
++            await self._respond(send, method, 405, TEXT, b"method not allowed")
++            return
++        if path == "/metrics":
++            await self._respond(
++                send, method, 200, CONTENT_TYPE, self.registry.render().encode("utf-8")
++            )
++            return
++        probe = self.probes.get(path)
++        if probe is None:
++            await self._respond(send, method, 404, TEXT, b"not found")
++            return
++        ok = probe()
++        status = 200 if ok else 503
++        query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
++        if query.get("verbose", [""])[0] == "1":
++            body = json.dumps(self.state.verbose(ok)).encode("utf-8")
++            await self._respond(send, method, status, JSON, body)
++            return
++        await self._respond(send, method, status, TEXT, b"ok" if ok else b"unavailable")
++
++    @staticmethod
++    async def _respond(
++        send: Send, method: str, status: int, content_type: str, body: bytes
++    ) -> None:
++        headers = [
++            (b"content-type", content_type.encode("ascii")),
++            (b"content-length", str(len(body)).encode("ascii")),
++            (b"cache-control", b"no-store"),
++        ]
++        await send({"type": "http.response.start", "status": status, "headers": headers})
++        await send({"type": "http.response.body", "body": b"" if method == "HEAD" else body})
+diff --git a/app/ops/config.py b/app/ops/config.py
+new file mode 100644
+index 0000000..8cf0f12
+--- /dev/null
++++ b/app/ops/config.py
+@@ -0,0 +1,116 @@
++"""Runtime configuration of the image, read from the environment and validated at startup."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++LOG_LEVELS = ("trace", "debug", "info", "warn", "error")
++LOG_FORMATS = ("json", "text")
++
++
++class ConfigError(ValueError):
++    """One clear startup error; the process exits non-zero on it."""
++
++
++def env_str(name: str, default: str) -> str:
++    raw = os.environ.get(name)
++    if raw is None or not raw.strip():
++        return default
++    return raw.strip()
++
++
++def env_number(name: str, default: float, low: float, high: float) -> float:
++    raw = env_str(name, f"{default:g}")
++    try:
++        value = float(raw)
++    except ValueError as exc:
++        raise ConfigError(f"{name}={raw!r} is not a number") from exc
++    if not low <= value <= high:
++        raise ConfigError(f"{name}={raw} is outside [{low:g}, {high:g}]")
++    return value
++
++
++def env_int(name: str, default: int, low: int, high: int) -> int:
++    raw = env_str(name, str(default))
++    try:
++        value = int(raw)
++    except ValueError as exc:
++        raise ConfigError(f"{name}={raw!r} is not an integer") from exc
++    if not low <= value <= high:
++        raise ConfigError(f"{name}={raw} is outside [{low}, {high}]")
++    return value
++
++
++def env_bool(name: str, default: bool) -> bool:
++    raw = env_str(name, "true" if default else "false").lower()
++    if raw in ("true", "1", "yes"):
++        return True
++    if raw in ("false", "0", "no"):
++        return False
++    raise ConfigError(f"{name}={raw!r} is not a boolean")
++
++
++def env_enum(name: str, default: str, allowed: tuple[str, ...]) -> str:
++    value = env_str(name, default).lower()
++    if value not in allowed:
++        raise ConfigError(f"{name}={value!r} is invalid; allowed: {', '.join(allowed)}")
++    return value
++
++
++@dataclass(frozen=True)
++class OpsConfig:
++    port: int
++    admin_port: int
++    bind_addr: str
++    log_level: str
++    log_format: str
++    access_log: bool
++    check_interval: float
++    check_timeout: float
++    stale_factor: float
++    drain_delay: float
++    drain_budget: float
++    app_version: str
++    app_revision: str
++
++    def redacted(self) -> dict[str, object]:
++        return {
++            "PORT": self.port,
++            "ADMIN_PORT": self.admin_port,
++            "BIND_ADDR": self.bind_addr,
++            "LOG_LEVEL": self.log_level,
++            "LOG_FORMAT": self.log_format,
++            "ACCESS_LOG": self.access_log,
++            "HEALTH_CHECK_INTERVAL": self.check_interval,
++            "HEALTH_CHECK_TIMEOUT": self.check_timeout,
++            "HEALTH_STALE_FACTOR": self.stale_factor,
++            "SHUTDOWN_DRAIN_DELAY": self.drain_delay,
++            "SHUTDOWN_TIMEOUT": self.drain_budget,
++        }
++
++
++def load() -> OpsConfig:
++    cfg = OpsConfig(
++        port=env_int("PORT", 8080, 1, 65535),
++        admin_port=env_int("ADMIN_PORT", 9090, 1, 65535),
++        bind_addr=env_str("BIND_ADDR", "0.0.0.0"),
++        log_level=env_enum("LOG_LEVEL", "info", LOG_LEVELS),
++        log_format=env_enum("LOG_FORMAT", "json", LOG_FORMATS),
++        access_log=env_bool("ACCESS_LOG", False),
++        check_interval=env_number("HEALTH_CHECK_INTERVAL", 5, 1, 3600),
++        check_timeout=env_number("HEALTH_CHECK_TIMEOUT", 2, 0.1, 3600),
++        stale_factor=env_number("HEALTH_STALE_FACTOR", 3, 1, 100),
++        drain_delay=env_number("SHUTDOWN_DRAIN_DELAY", 3, 0, 600),
++        drain_budget=env_number("SHUTDOWN_TIMEOUT", 10, 1, 3600),
++        app_version=env_str("APP_VERSION", "dev"),
++        app_revision=env_str("APP_REVISION", "unknown"),
++    )
++    if cfg.check_timeout >= cfg.check_interval:
++        raise ConfigError(
++            f"HEALTH_CHECK_TIMEOUT ({cfg.check_timeout:g}s) must be smaller than "
++            f"HEALTH_CHECK_INTERVAL ({cfg.check_interval:g}s)"
++        )
++    if cfg.port == cfg.admin_port:
++        raise ConfigError("PORT and ADMIN_PORT must differ")
++    return cfg
+diff --git a/app/ops/health.py b/app/ops/health.py
+new file mode 100644
+index 0000000..f91e0ff
+--- /dev/null
++++ b/app/ops/health.py
+@@ -0,0 +1,244 @@
++"""Cached health checker: one loop owns the real checks, the probes read the last snapshot."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import math
++import time
++from collections.abc import Callable, Iterable
++from concurrent.futures import Future, ThreadPoolExecutor
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from typing import Any
++
++from app.ops.config import OpsConfig
++from app.ops.logging import log
++from app.ops.metrics import CallbackFamily, Labels, Registry
++
++logger = logging.getLogger("app.ops.health")
++
++
++@dataclass(frozen=True)
++class CheckResult:
++    ok: bool
++    detail: str
++    duration: float
++    last_success: float
++
++
++@dataclass(frozen=True)
++class Snapshot:
++    results: dict[str, CheckResult]
++    taken_at: float
++    taken_wall: float
++
++
++@dataclass(frozen=True)
++class Check:
++    name: str
++    run: Callable[[], None]
++
++
++class HealthState:
++    """The probe view: an immutable snapshot behind one reference plus two latches."""
++
++    def __init__(self, cfg: OpsConfig) -> None:
++        self.cfg = cfg
++        self.snapshot: Snapshot | None = None
++        self.started = False
++        self.draining = False
++        self.cycles = 0
++
++    def age(self) -> float:
++        snapshot = self.snapshot
++        if snapshot is None:
++            return math.inf
++        return time.monotonic() - snapshot.taken_at
++
++    def fresh(self) -> bool:
++        return self.age() <= self.cfg.stale_factor * self.cfg.check_interval
++
++    def all_ok(self) -> bool:
++        snapshot = self.snapshot
++        return snapshot is not None and all(result.ok for result in snapshot.results.values())
++
++    def ready(self) -> bool:
++        return self.fresh() and self.all_ok() and not self.draining
++
++    def verbose(self, ok: bool) -> dict[str, Any]:
++        snapshot = self.snapshot
++        checks = {}
++        taken = None
++        if snapshot is not None:
++            taken = datetime.fromtimestamp(snapshot.taken_wall, UTC).isoformat()
++            checks = {
++                name: {
++                    "ok": result.ok,
++                    "detail": result.detail,
++                    "durationSeconds": round(result.duration, 6),
++                    "lastSuccess": (
++                        datetime.fromtimestamp(result.last_success, UTC).isoformat()
++                        if result.last_success
++                        else None
++                    ),
++                }
++                for name, result in snapshot.results.items()
++            }
++        return {
++            "status": "ok" if ok else "unavailable",
++            "started": self.started,
++            "draining": self.draining,
++            "checks": checks,
++            "takenAt": taken,
++        }
++
++    def register_metrics(self, registry: Registry) -> None:
++        def per_check(
++            field: Callable[[CheckResult], float],
++        ) -> Callable[[], Iterable[tuple[Labels, float]]]:
++            def collect() -> Iterable[tuple[Labels, float]]:
++                snapshot = self.snapshot
++                if snapshot is None:
++                    return []
++                return [((name,), field(result)) for name, result in snapshot.results.items()]
++
++            return collect
++
++        registry.register(
++            CallbackFamily(
++                "gauge",
++                "health_check_up",
++                "1 when the check passed in the last checker cycle.",
++                ("check",),
++                per_check(lambda result: 1.0 if result.ok else 0.0),
++            )
++        )
++        registry.register(
++            CallbackFamily(
++                "gauge",
++                "health_check_duration_seconds",
++                "Duration of the last run of the check.",
++                ("check",),
++                per_check(lambda result: result.duration),
++            )
++        )
++        registry.register(
++            CallbackFamily(
++                "gauge",
++                "health_check_last_success_timestamp_seconds",
++                "Unix time of the last pass of the check; 0 until it passed once.",
++                ("check",),
++                per_check(lambda result: result.last_success),
++            )
++        )
++        registry.register(
++            CallbackFamily(
++                "gauge",
++                "health_snapshot_age_seconds",
++                "Age of the cached health snapshot; staleness flips liveness.",
++                (),
++                lambda: [((), 0.0 if self.snapshot is None else self.age())],
++            )
++        )
++        registry.register(
++            CallbackFamily(
++                "counter",
++                "health_checker_cycles_total",
++                "Completed health checker cycles.",
++                (),
++                lambda: [((), float(self.cycles))],
++            )
++        )
++        registry.register(
++            CallbackFamily(
++                "gauge",
++                "health_draining",
++                "1 once the shutdown drain latch is set (readiness 503).",
++                (),
++                lambda: [((), 1.0 if self.draining else 0.0)],
++            )
++        )
++
++
++class Checker:
++    """Runs every registered check concurrently in its own threads, each bounded by the timeout."""
++
++    def __init__(self, cfg: OpsConfig, state: HealthState, checks: list[Check]) -> None:
++        self.cfg = cfg
++        self.state = state
++        self.checks = checks
++        self.in_flight: set[str] = set()
++        self.last_ready: bool | None = None
++        self.executor = ThreadPoolExecutor(
++            max_workers=max(1, len(checks)), thread_name_prefix="health-check"
++        )
++
++    def _finished(self, name: str, future: Future[Any]) -> None:
++        self.in_flight.discard(name)
++        if not future.cancelled():
++            future.exception()
++
++    async def run_one(self, check: Check, previous: CheckResult | None) -> CheckResult:
++        last_success = previous.last_success if previous is not None else 0.0
++        if check.name in self.in_flight:
++            return CheckResult(False, "previous run still in flight", 0.0, last_success)
++        started = time.monotonic()
++        self.in_flight.add(check.name)
++        future = asyncio.get_running_loop().run_in_executor(self.executor, check.run)
++        future.add_done_callback(lambda done: self._finished(check.name, done))
++        try:
++            await asyncio.wait_for(asyncio.shield(future), timeout=self.cfg.check_timeout)
++        except TimeoutError as exc:
++            duration = time.monotonic() - started
++            if duration >= self.cfg.check_timeout:
++                detail = f"timed out after {self.cfg.check_timeout:g}s"
++            else:
++                detail = f"{type(exc).__name__}: {exc}"
++            return CheckResult(False, detail[:500], duration, last_success)
++        except Exception as exc:
++            duration = time.monotonic() - started
++            detail = f"{type(exc).__name__}: {exc}"
++            return CheckResult(False, detail[:500], duration, last_success)
++        return CheckResult(True, "ok", time.monotonic() - started, time.time())
++
++    async def cycle(self) -> None:
++        snapshot = self.state.snapshot
++        previous = snapshot.results if snapshot is not None else {}
++        outcomes = await asyncio.gather(
++            *(self.run_one(check, previous.get(check.name)) for check in self.checks)
++        )
++        results = {check.name: result for check, result in zip(self.checks, outcomes, strict=True)}
++        self.state.snapshot = Snapshot(results, time.monotonic(), time.time())
++        self.state.cycles += 1
++        if not self.state.started and all(result.ok for result in results.values()):
++            self.state.started = True
++            log(logger, "info", "startup complete: first fully successful health cycle")
++        for name, result in results.items():
++            before = previous.get(name)
++            if before is not None and before.ok != result.ok:
++                transition = f"{before.ok} -> {result.ok} ({result.detail})"
++                log(
++                    logger,
++                    "info",
++                    f"health check '{name}' transitioned {transition}",
++                    **{"health.check": name, "health.up": result.ok},
++                )
++        ready = self.state.ready()
++        if self.last_ready is not None and ready != self.last_ready:
++            failing = sorted(name for name, result in results.items() if not result.ok)
++            log(
++                logger,
++                "info",
++                f"readiness {self.last_ready} -> {ready} (failing checks: {failing})",
++            )
++        self.last_ready = ready
++
++    async def loop(self) -> None:
++        while True:
++            begin = time.monotonic()
++            try:
++                await self.cycle()
++            except Exception:
++                logger.exception("health cycle failed")
++            await asyncio.sleep(max(0.0, self.cfg.check_interval - (time.monotonic() - begin)))
+diff --git a/app/ops/http.py b/app/ops/http.py
+new file mode 100644
+index 0000000..84e1246
+--- /dev/null
++++ b/app/ops/http.py
+@@ -0,0 +1,207 @@
++"""Instrumentation of the main listener: route classes, request ids, route metrics, access log."""
++
++from __future__ import annotations
++
++import logging
++import re
++import time
++import uuid
++from collections.abc import Awaitable, Callable, Iterable, Iterator
++from typing import Any
++
++from starlette.routing import Match
++
++from app.ops.logging import log, request_id
++from app.ops.metrics import Counter, Gauge, Histogram, Registry
++
++KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
++ROUTE_UNKNOWN = "UNKNOWN"
++REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
++
++access_logger = logging.getLogger("access")
++
++Scope = dict[str, Any]
++Message = dict[str, Any]
++Receive = Callable[[], Awaitable[Message]]
++Send = Callable[[Message], Awaitable[None]]
++
++
++def outcome_of(status: int) -> str:
++    if 100 <= status < 200:
++        return "INFORMATIONAL"
++    if 200 <= status < 300:
++        return "SUCCESS"
++    if 300 <= status < 400:
++        return "REDIRECTION"
++    if 400 <= status < 500:
++        return "CLIENT_ERROR"
++    if 500 <= status < 600:
++        return "SERVER_ERROR"
++    return "UNKNOWN"
++
++
++class RouteTable:
++    """Maps a request to the template of the route that serves it; anything else is UNKNOWN.
++
++    Included routers are flattened: FastAPI keeps them as lazy wrappers (`original_router`
++    plus an include context with the prefix) instead of copying their routes into the app.
++    """
++
++    def __init__(self, app: Any) -> None:
++        self.routes = list(self._leaves(app.routes, ""))
++
++    @classmethod
++    def _leaves(cls, routes: Iterable[Any], prefix: str) -> Iterator[tuple[Any, str, str]]:
++        for route in routes:
++            included = getattr(route, "original_router", None)
++            if included is not None:
++                context = getattr(route, "include_context", None)
++                extra = getattr(context, "prefix", "") or ""
++                yield from cls._leaves(included.routes, prefix + extra)
++                continue
++            template = getattr(route, "path_format", None)
++            if template is None:
++                nested = getattr(route, "routes", None)
++                if nested:
++                    yield from cls._leaves(nested, prefix + (getattr(route, "path", "") or ""))
++                continue
++            yield route, prefix, prefix + template
++
++    def templates(self) -> list[str]:
++        return sorted({template for _, _, template in self.routes})
++
++    def classify(self, scope: Scope) -> str:
++        path = str(scope.get("path", ""))
++        for route, prefix, template in self.routes:
++            candidate = scope
++            if prefix:
++                if not path.startswith(prefix):
++                    continue
++                candidate = {**scope, "path": path[len(prefix) :]}
++            match, _ = route.matches(candidate)
++            if match is not Match.NONE:
++                return template
++        return ROUTE_UNKNOWN
++
++
++class RequestMetrics:
++    def __init__(self, registry: Registry, templates: list[str]) -> None:
++        self.requests = registry.register(
++            Histogram(
++                "http_server_requests_seconds",
++                "Duration of requests served on the main listener, by route template.",
++                ("method", "uri", "status", "outcome", "exception"),
++            )
++        )
++        self.active = registry.register(
++            Gauge(
++                "http_server_requests_active",
++                "Requests currently in flight on the main listener.",
++                ("method", "uri"),
++            )
++        )
++        self.request_bytes = registry.register(
++            Counter(
++                "http_server_request_bytes_total",
++                "Request body bytes read on the main listener, by route template.",
++                ("uri",),
++            )
++        )
++        self.response_bytes = registry.register(
++            Counter(
++                "http_server_response_bytes_total",
++                "Response body bytes written on the main listener, by route template.",
++                ("uri",),
++            )
++        )
++        for template in [*templates, ROUTE_UNKNOWN]:
++            self.request_bytes.touch(template)
++            self.response_bytes.touch(template)
++
++
++class Instrumentation:
++    """Pure ASGI wrapper around the application; probe traffic never passes through it."""
++
++    def __init__(
++        self, app: Any, routes: RouteTable, metrics: RequestMetrics, access_log: bool
++    ) -> None:
++        self.app = app
++        self.routes = routes
++        self.metrics = metrics
++        self.access_log = access_log
++
++    @staticmethod
++    def _request_id(scope: Scope) -> str:
++        for name, value in scope.get("headers", ()):
++            if name == b"x-request-id":
++                candidate = value.decode("latin-1")
++                if REQUEST_ID_PATTERN.match(candidate):
++                    return candidate
++                break
++        return str(uuid.uuid4())
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] != "http":
++            await self.app(scope, receive, send)
++            return
++        started = time.perf_counter()
++        raw_method = str(scope.get("method", ""))
++        method = raw_method if raw_method in KNOWN_METHODS else "OTHER"
++        uri = self.routes.classify(scope)
++        rid = self._request_id(scope)
++        token = request_id.set(rid)
++        status = 0
++        request_bytes = 0
++        response_bytes = 0
++        exception = "none"
++        self.metrics.active.inc(method, uri)
++
++        async def receive_counted() -> Message:
++            nonlocal request_bytes
++            message = await receive()
++            if message["type"] == "http.request":
++                request_bytes += len(message.get("body", b""))
++            return message
++
++        async def send_counted(message: Message) -> None:
++            nonlocal status, response_bytes
++            if message["type"] == "http.response.start":
++                status = int(message["status"])
++                headers = list(message.get("headers", []))
++                headers.append((b"x-request-id", rid.encode("ascii")))
++                message = {**message, "headers": headers}
++            elif message["type"] == "http.response.body":
++                response_bytes += len(message.get("body", b""))
++            await send(message)
++
++        try:
++            await self.app(scope, receive_counted, send_counted)
++        except Exception as exc:
++            exception = type(exc).__name__
++            if status == 0:
++                status = 500
++            raise
++        finally:
++            elapsed = time.perf_counter() - started
++            self.metrics.active.dec(method, uri)
++            self.metrics.requests.observe(
++                method, uri, str(status), outcome_of(status), exception, value=elapsed
++            )
++            self.metrics.request_bytes.inc(uri, amount=float(request_bytes))
++            self.metrics.response_bytes.inc(uri, amount=float(response_bytes))
++            if self.access_log:
++                log(
++                    access_logger,
++                    "info",
++                    f"{raw_method} {uri} {status}",
++                    **{
++                        "http.request.id": rid,
++                        "http.request.method": raw_method,
++                        "url.path": uri,
++                        "http.response.status_code": status,
++                        "event.duration": int(elapsed * 1e9),
++                        "http.request.bytes": request_bytes,
++                        "http.response.bytes": response_bytes,
++                    },
++                )
++            request_id.reset(token)
+diff --git a/app/ops/logging.py b/app/ops/logging.py
+new file mode 100644
+index 0000000..bb47664
+--- /dev/null
++++ b/app/ops/logging.py
+@@ -0,0 +1,121 @@
++"""ECS-shaped JSON logging on stdout (flat dotted keys, one object per line), or a text form."""
++
++from __future__ import annotations
++
++import json
++import logging
++import sys
++import traceback
++from contextvars import ContextVar
++from datetime import UTC, datetime
++from typing import Any
++
++SERVICE_NAME = "module-service"
++ECS_VERSION = "8.11"
++TRACE = 5
++LEVEL_NUMBERS = {
++    "trace": TRACE,
++    "debug": logging.DEBUG,
++    "info": logging.INFO,
++    "warn": logging.WARNING,
++    "error": logging.ERROR,
++}
++
++request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
++
++
++def level_name(levelno: int) -> str:
++    if levelno >= logging.ERROR:
++        return "error"
++    if levelno >= logging.WARNING:
++        return "warn"
++    if levelno >= logging.INFO:
++        return "info"
++    if levelno >= logging.DEBUG:
++        return "debug"
++    return "trace"
++
++
++def _timestamp(record: logging.LogRecord) -> str:
++    moment = datetime.fromtimestamp(record.created, UTC)
++    return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
++
++
++class _EcsFormatter(logging.Formatter):
++    def __init__(self, version: str) -> None:
++        super().__init__()
++        self.version = version
++
++    def fields(self, record: logging.LogRecord) -> dict[str, Any]:
++        entry: dict[str, Any] = {
++            "@timestamp": _timestamp(record),
++            "log.level": level_name(record.levelno),
++            "log.logger": record.name,
++            "message": record.getMessage(),
++            "ecs.version": ECS_VERSION,
++            "service.name": SERVICE_NAME,
++            "service.version": self.version,
++            "process.pid": record.process,
++            "process.thread.name": record.threadName,
++        }
++        extra = getattr(record, "ecs", None)
++        if isinstance(extra, dict):
++            entry.update(extra)
++        rid = request_id.get()
++        if rid is not None:
++            entry.setdefault("http.request.id", rid)
++        if record.exc_info and record.exc_info[0] is not None:
++            entry["error.type"] = record.exc_info[0].__name__
++            entry["error.message"] = str(record.exc_info[1])
++            entry["error.stack_trace"] = "".join(traceback.format_exception(*record.exc_info))
++        return entry
++
++
++class JsonFormatter(_EcsFormatter):
++    def format(self, record: logging.LogRecord) -> str:
++        return json.dumps(self.fields(record), default=str, separators=(",", ":"))
++
++
++class TextFormatter(_EcsFormatter):
++    FIXED = frozenset(
++        {
++            "@timestamp",
++            "log.level",
++            "log.logger",
++            "message",
++            "ecs.version",
++            "service.name",
++            "service.version",
++            "process.pid",
++            "process.thread.name",
++            "error.stack_trace",
++        }
++    )
++
++    def format(self, record: logging.LogRecord) -> str:
++        entry = self.fields(record)
++        level = str(entry["log.level"]).upper()
++        origin = f"{SERVICE_NAME}[{entry['log.logger']}]"
++        line = f"{entry['@timestamp']} {level:5} {origin}: {entry['message']}"
++        for key in sorted(entry):
++            if key not in self.FIXED:
++                line += f" {key}={entry[key]}"
++        if "error.stack_trace" in entry:
++            line += "\n" + str(entry["error.stack_trace"]).rstrip()
++        return line
++
++
++def configure(level: str, fmt: str, version: str) -> None:
++    logging.addLevelName(TRACE, "TRACE")
++    root = logging.getLogger()
++    root.handlers.clear()
++    handler = logging.StreamHandler(sys.stdout)
++    handler.setFormatter(JsonFormatter(version) if fmt == "json" else TextFormatter(version))
++    root.addHandler(handler)
++    root.setLevel(LEVEL_NUMBERS[level])
++    logging.getLogger("uvicorn.error").setLevel(max(LEVEL_NUMBERS[level], logging.WARNING))
++    logging.getLogger("uvicorn.access").disabled = True
++
++
++def log(logger: logging.Logger, level: str, message: str, **fields: Any) -> None:
++    logger.log(LEVEL_NUMBERS[level], message, extra={"ecs": fields})
+diff --git a/app/ops/metrics.py b/app/ops/metrics.py
+new file mode 100644
+index 0000000..0b5b5f9
+--- /dev/null
++++ b/app/ops/metrics.py
+@@ -0,0 +1,299 @@
++"""A small OpenMetrics registry: counters, gauges, histograms and callback-driven families."""
++
++from __future__ import annotations
++
++import gc
++import math
++import os
++import platform
++import resource
++import threading
++import time
++from collections.abc import Callable, Iterable
++
++LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
++CONTENT_TYPE = "application/openmetrics-text; version=1.0.0; charset=utf-8"
++
++Labels = tuple[str, ...]
++Sample = tuple[str, Labels, float]
++PROCESS_START = time.time()
++
++
++def _escape(value: str) -> str:
++    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
++
++
++def _format_value(value: float) -> str:
++    if math.isinf(value):
++        return "+Inf" if value > 0 else "-Inf"
++    if math.isnan(value):
++        return "NaN"
++    if float(value).is_integer() and abs(value) < 1e15:
++        return str(int(value))
++    return repr(float(value))
++
++
++def _format_bound(value: float) -> str:
++    return "+Inf" if math.isinf(value) else repr(float(value))
++
++
++class Family:
++    kind = "gauge"
++
++    def __init__(self, name: str, help_text: str, labelnames: Labels = ()) -> None:
++        self.name = name
++        self.help_text = help_text
++        self.labelnames = labelnames
++        self._lock = threading.Lock()
++
++    @property
++    def exposition_name(self) -> str:
++        if self.kind == "counter" and self.name.endswith("_total"):
++            return self.name[: -len("_total")]
++        return self.name
++
++    def samples(self) -> Iterable[Sample]:
++        raise NotImplementedError
++
++
++class Counter(Family):
++    kind = "counter"
++
++    def __init__(self, name: str, help_text: str, labelnames: Labels = ()) -> None:
++        super().__init__(name, help_text, labelnames)
++        self._values: dict[Labels, float] = {}
++
++    def inc(self, *labels: str, amount: float = 1.0) -> None:
++        with self._lock:
++            self._values[labels] = self._values.get(labels, 0.0) + amount
++
++    def touch(self, *labels: str) -> None:
++        with self._lock:
++            self._values.setdefault(labels, 0.0)
++
++    def samples(self) -> Iterable[Sample]:
++        with self._lock:
++            items = list(self._values.items())
++        for labels, value in items:
++            yield ("_total", labels, value)
++
++
++class Gauge(Family):
++    kind = "gauge"
++
++    def __init__(self, name: str, help_text: str, labelnames: Labels = ()) -> None:
++        super().__init__(name, help_text, labelnames)
++        self._values: dict[Labels, float] = {}
++
++    def set(self, *labels: str, value: float) -> None:
++        with self._lock:
++            self._values[labels] = value
++
++    def inc(self, *labels: str, amount: float = 1.0) -> None:
++        with self._lock:
++            self._values[labels] = self._values.get(labels, 0.0) + amount
++
++    def dec(self, *labels: str, amount: float = 1.0) -> None:
++        self.inc(*labels, amount=-amount)
++
++    def touch(self, *labels: str) -> None:
++        with self._lock:
++            self._values.setdefault(labels, 0.0)
++
++    def samples(self) -> Iterable[Sample]:
++        with self._lock:
++            items = list(self._values.items())
++        for labels, value in items:
++            yield ("", labels, value)
++
++
++class Histogram(Family):
++    kind = "histogram"
++
++    def __init__(
++        self,
++        name: str,
++        help_text: str,
++        labelnames: Labels = (),
++        buckets: tuple[float, ...] = LATENCY_BUCKETS,
++    ) -> None:
++        super().__init__(name, help_text, labelnames)
++        self.buckets = buckets
++        self._states: dict[Labels, tuple[list[int], list[float]]] = {}
++
++    def observe(self, *labels: str, value: float) -> None:
++        with self._lock:
++            state = self._states.get(labels)
++            if state is None:
++                state = ([0] * (len(self.buckets) + 1), [0.0])
++                self._states[labels] = state
++            counts, total = state
++            for index, bound in enumerate(self.buckets):
++                if value <= bound:
++                    counts[index] += 1
++                    break
++            else:
++                counts[-1] += 1
++            total[0] += value
++
++    def samples(self) -> Iterable[Sample]:
++        with self._lock:
++            items = [
++                (labels, list(counts), total[0]) for labels, (counts, total) in self._states.items()
++            ]
++        for labels, counts, total in items:
++            cumulative = 0
++            for index, bound in enumerate(self.buckets):
++                cumulative += counts[index]
++                yield ("_bucket", (*labels, _format_bound(bound)), cumulative)
++            cumulative += counts[-1]
++            yield ("_bucket", (*labels, "+Inf"), cumulative)
++            yield ("_count", labels, cumulative)
++            yield ("_sum", labels, total)
++
++
++class CallbackFamily(Family):
++    """A family whose samples are computed at scrape time from data the process already holds."""
++
++    def __init__(
++        self,
++        kind: str,
++        name: str,
++        help_text: str,
++        labelnames: Labels,
++        callback: Callable[[], Iterable[tuple[Labels, float]]],
++    ) -> None:
++        super().__init__(name, help_text, labelnames)
++        self.kind = kind
++        self.callback = callback
++
++    def samples(self) -> Iterable[Sample]:
++        suffix = "_total" if self.kind == "counter" else ""
++        for labels, value in self.callback():
++            yield (suffix, labels, value)
++
++
++class Registry:
++    def __init__(self) -> None:
++        self.families: list[Family] = []
++
++    def register[F: Family](self, family: F) -> F:
++        self.families.append(family)
++        return family
++
++    def render(self) -> str:
++        out: list[str] = []
++        for family in self.families:
++            name = family.exposition_name
++            out.append(f"# HELP {name} {_escape(family.help_text)}\n# TYPE {name} {family.kind}\n")
++            for suffix, labels, value in family.samples():
++                names = (*family.labelnames, "le") if suffix == "_bucket" else family.labelnames
++                pairs = ",".join(
++                    f'{k}="{_escape(str(v))}"' for k, v in zip(names, labels, strict=True)
++                )
++                if pairs:
++                    out.append(f"{name}{suffix}{{{pairs}}} {_format_value(value)}\n")
++                else:
++                    out.append(f"{name}{suffix} {_format_value(value)}\n")
++        out.append("# EOF\n")
++        return "".join(out)
++
++
++def _statm() -> tuple[int, int]:
++    with open("/proc/self/statm", encoding="ascii") as handle:
++        size, resident = handle.read().split()[:2]
++    page = os.sysconf("SC_PAGE_SIZE")
++    return int(size) * page, int(resident) * page
++
++
++def _cpu_seconds() -> Iterable[tuple[Labels, float]]:
++    usage = resource.getrusage(resource.RUSAGE_SELF)
++    return [((), usage.ru_utime + usage.ru_stime)]
++
++
++def _gc_stat(key: str) -> Callable[[], Iterable[tuple[Labels, float]]]:
++    return lambda: [((str(gen),), float(stat[key])) for gen, stat in enumerate(gc.get_stats())]
++
++
++def register_process_families(registry: Registry) -> None:
++    families = [
++        (
++            "gauge",
++            "process_start_time_seconds",
++            "Start time of the process since unix epoch.",
++            (),
++            lambda: [((), PROCESS_START)],
++        ),
++        (
++            "counter",
++            "process_cpu_seconds_total",
++            "Total user and system CPU time.",
++            (),
++            _cpu_seconds,
++        ),
++        (
++            "gauge",
++            "process_resident_memory_bytes",
++            "Resident memory size.",
++            (),
++            lambda: [((), float(_statm()[1]))],
++        ),
++        (
++            "gauge",
++            "process_virtual_memory_bytes",
++            "Virtual memory size.",
++            (),
++            lambda: [((), float(_statm()[0]))],
++        ),
++        (
++            "gauge",
++            "process_open_fds",
++            "Number of open file descriptors.",
++            (),
++            lambda: [((), float(len(os.listdir("/proc/self/fd"))))],
++        ),
++        (
++            "gauge",
++            "process_max_fds",
++            "Maximum number of open file descriptors.",
++            (),
++            lambda: [((), float(resource.getrlimit(resource.RLIMIT_NOFILE)[0]))],
++        ),
++        (
++            "gauge",
++            "python_info",
++            "The Python runtime compiled into the binary.",
++            ("implementation", "version"),
++            lambda: [((platform.python_implementation(), platform.python_version()), 1.0)],
++        ),
++        (
++            "gauge",
++            "python_threads",
++            "Live threads of the process.",
++            (),
++            lambda: [((), float(threading.active_count()))],
++        ),
++        (
++            "counter",
++            "python_gc_collections_total",
++            "Garbage collections per generation.",
++            ("generation",),
++            _gc_stat("collections"),
++        ),
++        (
++            "counter",
++            "python_gc_objects_collected_total",
++            "Objects collected per generation.",
++            ("generation",),
++            _gc_stat("collected"),
++        ),
++        (
++            "counter",
++            "python_gc_objects_uncollectable_total",
++            "Uncollectable objects found per generation.",
++            ("generation",),
++            _gc_stat("uncollectable"),
++        ),
++    ]
++    for kind, name, help_text, labelnames, callback in families:
++        registry.register(CallbackFamily(kind, name, help_text, labelnames, callback))
+diff --git a/app/ops/probe.py b/app/ops/probe.py
+new file mode 100644
+index 0000000..0964c5d
+--- /dev/null
++++ b/app/ops/probe.py
+@@ -0,0 +1,50 @@
++"""The exec-style probe command: a local GET against the admin listener, exit 0 on 200."""
++
++from __future__ import annotations
++
++import http.client
++import os
++import sys
++
++ENDPOINTS = ("startupz", "livez", "readyz")
++
++
++def probe_host(bind_addr: str) -> str:
++    if bind_addr in ("", "0.0.0.0", "*"):
++        return "127.0.0.1"
++    if bind_addr == "::":
++        return "::1"
++    return bind_addr
++
++
++def main(argv: list[str]) -> int:
++    endpoint = "livez"
++    for arg in argv:
++        if arg.startswith("--endpoint="):
++            endpoint = arg.split("=", 1)[1]
++        else:
++            print(
++                f"unknown argument {arg!r}; usage: healthcheck --endpoint=<startupz|livez|readyz>",
++                file=sys.stderr,
++            )
++            return 1
++    if endpoint not in ENDPOINTS:
++        print(f"unknown endpoint {endpoint!r}; allowed: {', '.join(ENDPOINTS)}", file=sys.stderr)
++        return 1
++    host = probe_host(os.environ.get("BIND_ADDR", "").strip())
++    raw_port = os.environ.get("ADMIN_PORT", "").strip() or "9090"
++    try:
++        port = int(raw_port)
++    except ValueError:
++        print(f"ADMIN_PORT={raw_port!r} is not an integer", file=sys.stderr)
++        return 1
++    try:
++        connection = http.client.HTTPConnection(host, port, timeout=3)
++        connection.request("GET", f"/{endpoint}")
++        response = connection.getresponse()
++        response.read()
++        connection.close()
++    except OSError as exc:
++        print(f"probe failed: {exc}", file=sys.stderr)
++        return 1
++    return 0 if response.status == 200 else 1
+diff --git a/app/ops/server.py b/app/ops/server.py
+new file mode 100644
+index 0000000..22965d1
+--- /dev/null
++++ b/app/ops/server.py
+@@ -0,0 +1,295 @@
++"""Process entry: configuration, logging, both listeners, the checker and the drain sequence."""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import os
++import signal
++import sys
++import time
++from collections.abc import Iterable
++from typing import Any
++
++import anyio._backends._asyncio  # noqa: F401
++import sqlalchemy.dialects.mysql.pymysql  # noqa: F401
++import uvicorn.lifespan.off  # noqa: F401
++import uvicorn.lifespan.on  # noqa: F401
++import uvloop
++from pydantic import ValidationError
++from sqlalchemy import event, text
++from sqlalchemy.engine import Engine
++from uvicorn import Config, Server
++from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
++
++from app.ops import config as ops_config
++from app.ops.admin import AdminApp
++from app.ops.health import Check, Checker, HealthState
++from app.ops.http import Instrumentation, RequestMetrics, RouteTable
++from app.ops.logging import SERVICE_NAME, log
++from app.ops.logging import configure as configure_logging
++from app.ops.metrics import (
++    CallbackFamily,
++    Counter,
++    Gauge,
++    Histogram,
++    Labels,
++    Registry,
++    register_process_families,
++)
++
++logger = logging.getLogger("app.ops.server")
++STATEMENT_OPERATIONS = ("select", "insert", "update", "delete")
++
++
++def fatal(message: str) -> int:
++    print(f"fatal configuration error: {message}", file=sys.stderr, flush=True)
++    return 1
++
++
++def build_server(app: Any, host: str, port: int, lifespan: str, graceful: float | None) -> Server:
++    config = Config(
++        app,
++        host=host,
++        port=port,
++        http=HttpToolsProtocol,
++        ws=None,
++        lifespan=lifespan,
++        log_config=None,
++        access_log=False,
++        server_header=False,
++        timeout_graceful_shutdown=graceful,
++    )
++    config.load()
++    server = Server(config)
++    server.lifespan = config.lifespan_class(config)
++    return server
++
++
++def database_checks(engine: Engine) -> list[Check]:
++    def connectivity() -> None:
++        with engine.connect() as connection:
++            connection.execute(text("SELECT 1"))
++
++    def schema() -> None:
++        with engine.connect() as connection:
++            connection.execute(text("SELECT 1 FROM modules LIMIT 1"))
++
++    return [Check("database", connectivity), Check("schema", schema)]
++
++
++def register_database_metrics(registry: Registry, engine: Engine) -> None:
++    statements = registry.register(
++        Histogram(
++            "db_client_statements_seconds",
++            "Duration of SQL statements executed against the database, by operation.",
++            ("operation",),
++        )
++    )
++    errors = registry.register(
++        Counter(
++            "db_client_statement_errors_total",
++            "SQL statements that raised an error, by operation.",
++            ("operation",),
++        )
++    )
++    for operation in [*STATEMENT_OPERATIONS, "other"]:
++        errors.touch(operation)
++
++    def operation_of(statement: str) -> str:
++        head = statement.lstrip().split(None, 1)[0].lower() if statement.strip() else ""
++        return head if head in STATEMENT_OPERATIONS else "other"
++
++    @event.listens_for(engine, "before_cursor_execute")
++    def before(
++        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
++    ) -> None:
++        conn.info["statement_started"] = time.perf_counter()
++
++    @event.listens_for(engine, "after_cursor_execute")
++    def after(
++        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
++    ) -> None:
++        started = conn.info.pop("statement_started", None)
++        if started is not None:
++            statements.observe(operation_of(statement), value=time.perf_counter() - started)
++
++    @event.listens_for(engine, "handle_error")
++    def failed(exception_context: Any) -> None:
++        statement = exception_context.statement or ""
++        errors.inc(operation_of(statement))
++        connection = exception_context.connection
++        if connection is not None:
++            started = connection.info.pop("statement_started", None)
++            if started is not None:
++                statements.observe(operation_of(statement), value=time.perf_counter() - started)
++
++    def pool_state() -> Iterable[tuple[Labels, float]]:
++        pool = engine.pool
++        checked_in = getattr(pool, "checkedin", lambda: 0)()
++        checked_out = getattr(pool, "checkedout", lambda: 0)()
++        overflow = max(0, getattr(pool, "overflow", lambda: 0)())
++        return [
++            (("checked_out",), float(checked_out)),
++            (("idle",), float(checked_in)),
++            (("overflow",), float(overflow)),
++        ]
++
++    registry.register(
++        CallbackFamily(
++            "gauge",
++            "db_pool_connections",
++            "Connections of the SQLAlchemy pool by state.",
++            ("state",),
++            pool_state,
++        )
++    )
++    registry.register(
++        CallbackFamily(
++            "gauge",
++            "db_pool_size",
++            "Configured size of the SQLAlchemy connection pool.",
++            (),
++            lambda: [((), float(getattr(engine.pool, "size", lambda: 0)()))],
++        )
++    )
++
++
++def main() -> int:
++    try:
++        cfg = ops_config.load()
++    except ops_config.ConfigError as exc:
++        return fatal(str(exc))
++    configure_logging(cfg.log_level, cfg.log_format, cfg.app_version)
++    try:
++        from app.config import get_settings
++
++        settings = get_settings()
++    except ValidationError as exc:
++        details = "; ".join(
++            f"{'.'.join(str(part) for part in error['loc']) or 'settings'}: {error['msg']}"
++            for error in exc.errors()
++        )
++        return fatal(details)
++    from app.database import engine
++    from app.main import app as fastapi_app
++
++    redacted = {
++        **cfg.redacted(),
++        "DATABASE_URL": engine.url.render_as_string(hide_password=True),
++        "MYSQL_SSL_MODE": settings.mysql_ssl_mode.value,
++        "MYSQL_SSL_CA": str(settings.mysql_ssl_ca) if settings.mysql_ssl_ca else "",
++        "DB_CONNECT_TIMEOUT": settings.db_connect_timeout,
++        "DB_POOL_SIZE": settings.db_pool_size,
++        "DB_POOL_MAX_OVERFLOW": settings.db_pool_max_overflow,
++        "DB_POOL_RECYCLE": settings.db_pool_recycle,
++    }
++    return asyncio.run(
++        serve(cfg, redacted, engine, fastapi_app), loop_factory=uvloop.new_event_loop
++    )
++
++
++async def serve(
++    cfg: ops_config.OpsConfig, redacted: dict[str, Any], engine: Engine, fastapi_app: Any
++) -> int:
++    registry = Registry()
++    registry.register(
++        Gauge("build_info", "The running artifact; always 1.", ("version", "revision"))
++    ).set(cfg.app_version, cfg.app_revision, value=1.0)
++    state = HealthState(cfg)
++    state.register_metrics(registry)
++    routes = RouteTable(fastapi_app)
++    request_metrics = RequestMetrics(registry, routes.templates())
++    register_database_metrics(registry, engine)
++    register_process_families(registry)
++
++    admin_server = build_server(
++        AdminApp(state, registry), cfg.bind_addr, cfg.admin_port, "off", 1.0
++    )
++    main_server = build_server(
++        Instrumentation(fastapi_app, routes, request_metrics, cfg.access_log),
++        cfg.bind_addr,
++        cfg.port,
++        "on",
++        None,
++    )
++    registry.register(
++        CallbackFamily(
++            "gauge",
++            "http_server_connections_active",
++            "Open TCP connections per listener.",
++            ("listener",),
++            lambda: [
++                (("main",), float(len(main_server.server_state.connections))),
++                (("admin",), float(len(admin_server.server_state.connections))),
++            ],
++        )
++    )
++
++    await admin_server.startup()
++    checker = Checker(cfg, state, database_checks(engine))
++    checker_task = asyncio.create_task(checker.loop(), name="health-checker")
++    await main_server.startup()
++    config_line = " ".join(f"{key}={value}" for key, value in redacted.items())
++    log(
++        logger,
++        "info",
++        f"{SERVICE_NAME} listening: version={cfg.app_version} revision={cfg.app_revision} "
++        f"routes={routes.templates()} config[{config_line}]",
++        **{"service.revision": cfg.app_revision, "process.pid": os.getpid()},
++    )
++
++    stop = asyncio.Event()
++    received: list[str] = []
++
++    def on_signal(name: str) -> None:
++        if received:
++            log(logger, "info", f"received {name} while draining: ignored")
++            return
++        received.append(name)
++        stop.set()
++
++    loop = asyncio.get_running_loop()
++    for sig in (signal.SIGTERM, signal.SIGINT):
++        loop.add_signal_handler(sig, on_signal, sig.name)
++    main_task = asyncio.create_task(main_server.main_loop(), name="main-listener")
++    admin_task = asyncio.create_task(admin_server.main_loop(), name="admin-listener")
++
++    await stop.wait()
++    state.draining = True
++    log(
++        logger,
++        "info",
++        f"received {received[0]}: draining (readiness now 503, drain delay {cfg.drain_delay:g}s)",
++    )
++    await asyncio.sleep(cfg.drain_delay)
++    begin = time.monotonic()
++    main_server.should_exit = True
++    await main_task
++    drained = True
++    try:
++        await asyncio.wait_for(main_server.shutdown(), timeout=cfg.drain_budget)
++    except TimeoutError:
++        drained = False
++        abandoned = len(main_server.server_state.connections)
++        log(
++            logger,
++            "error",
++            f"drain budget of {cfg.drain_budget:g}s exhausted: "
++            f"{abandoned} connection(s) still open, closing them",
++        )
++        for connection in list(main_server.server_state.connections):
++            connection.transport.close()
++    checker_task.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await checker_task
++    admin_server.should_exit = True
++    await admin_task
++    await admin_server.shutdown()
++    engine.dispose()
++    elapsed = time.monotonic() - begin
++    if not drained:
++        return 1
++    log(logger, "info", f"graceful shutdown complete in {elapsed:.3f}s")
++    return 0
+diff --git a/pyproject.toml b/pyproject.toml
+index 1d06753..d86bbdd 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -12,6 +12,7 @@ dependencies = [
+     "pydantic-settings>=2.8,<3",
+     "pymysql[rsa]>=1.1,<2",
+     "sqlalchemy>=2.0,<3",
++    "starlette>=1.3.1,<2",
+     "uvicorn[standard]>=0.34,<1",
+ ]
+ 
+diff --git a/uv.lock b/uv.lock
+index c44eb8e..2966039 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -465,6 +465,7 @@ dependencies = [
+     { name = "pydantic-settings" },
+     { name = "pymysql", extra = ["rsa"] },
+     { name = "sqlalchemy" },
++    { name = "starlette" },
+     { name = "uvicorn", extra = ["standard"] },
+ ]
+ 
+@@ -486,6 +487,7 @@ requires-dist = [
+     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6,<7" },
+     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11,<1" },
+     { name = "sqlalchemy", specifier = ">=2.0,<3" },
++    { name = "starlette", specifier = ">=1.3.1,<2" },
+     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
+ ]
+ provides-extras = ["dev"]
+@@ -797,15 +799,15 @@ wheels = [
+ 
+ [[package]]
+ name = "starlette"
+-version = "0.52.1"
++version = "1.6.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "anyio" },
+     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b", size = 2716969, upload-time = "2026-08-08T18:27:57.512Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
++    { url = "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da6e7986cc70c9fa5d778eda57538edfe56/starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c", size = 75969, upload-time = "2026-08-08T18:27:56.196Z" },
+ ]
+ 
+ [[package]]
+@@ -1097,4 +1099,4 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/2c/84/77599922ab441bfe61508f97dab2c71f8e114d31793993ea54011db16199/websockets-17.1-cp315-cp315t-win_amd64.whl", hash = "sha256:ad68c28a27246fed109a4409393d677b7e1388345cbbd2f5aee5c182d8506110", size = 217448, upload-time = "2026-08-26T14:58:21.382Z" },
+     { url = "https://files.pythonhosted.org/packages/ce/3c/8b9a225b523f06a9389be81f1b0ab07c49bec6014742e6aa359c1f920f1f/websockets-17.1-cp315-cp315t-win_arm64.whl", hash = "sha256:e552e0037230ac16e5f568de7012041344d1b18c9feed30ec2891b8eba55af81", size = 217372, upload-time = "2026-08-26T14:58:22.807Z" },
+     { url = "https://files.pythonhosted.org/packages/41/63/23572870e01836a98346075b9e17a8bc24a6ddd9800a3204ceee58677f3c/websockets-17.1-py3-none-any.whl", hash = "sha256:f221081107b8c48184d99f7019604486376e7ef826037e70aad6b02540732c23", size = 211134, upload-time = "2026-08-26T17:25:31.397Z" },
+-]
+\ No newline at end of file
++]

@@ -1,6 +1,6 @@
 # user-mgmt-service — image contract
 
-Image: localhost/user-mgmt-service:0.0.3 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
+Image: localhost/user-mgmt-service:0.0.4 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
 registry — the OCI version label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10021:10021 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (the native binary serves endpoints, checker loop, signals, probe subcommand)
@@ -8,10 +8,13 @@ Checker runtime: none — in-process
 Layer format: OCI, zstd:chunked (applied at push, see Publishing)
 
 Source: `github.com/yagan93/user_mgmt_service` @ `747b7f4e3d1f09cc4434a75d9c991ea091fda548`, cloned during the build and
-patched with `patches/0001-container-build-standard.patch` (health/ops machinery, graceful shutdown,
-GraalVM native build config, Micrometer/Actuator metrics served on the admin port, request-id
-correlation, access log, domain events). Spring Boot 4.1.0-M3 (pre-release milestone), Java 25,
-compiled with GraalVM native-image (no JVM in the image).
+patched, in order, with `patches/0001-module-assignment.patch` (the module feature, written as an
+upstream pull request: the `/modules` proxy endpoints, module assignment on users, and the
+module-service client with timeouts, retry and circuit breaker) and
+`patches/0002-container-build-standard.patch` (health/ops machinery, graceful shutdown, GraalVM
+native build config, Micrometer/Actuator metrics served on the admin port, request-id correlation,
+access log, domain events, the client-side metrics of the modules hop). Spring Boot 4.1.0-M3
+(pre-release milestone), Java 25, compiled with GraalVM native-image (no JVM in the image).
 
 Final base (per architecture, deliberate split):
 - linux/amd64: `scratch` — fully static native binary (`--static --libc=musl`)
@@ -21,7 +24,7 @@ Final base (per architecture, deliberate split):
 ## Ports
 | Env        | Default | Purpose                                                        |
 |------------|---------|----------------------------------------------------------------|
-| PORT       | 8080    | HTTP REST API (`/users/...`)                                   |
+| PORT       | 8080    | HTTP REST API (`/users/...`, `/modules`)                       |
 | ADMIN_PORT | 9090    | /startupz /livez /readyz /metrics (OpenMetrics, see Metrics)   |
 
 ## Configuration (all runtime-overridable)
@@ -34,6 +37,12 @@ Final base (per architecture, deliberate split):
 | JWT_ISSUER                   | required | —       | issuer claim of issued tokens                      |
 | JWT_SECRET                   | required | —       | secret; Base64, must decode to >= 256 bits (HMAC)  |
 | JWT_EXPIRATION_MILLIS        | required | —       | token lifetime in milliseconds                     |
+| MODULE_SERVICE_URL           | required | —       | base URL of the module service as reachable FROM THIS CONTAINER, e.g. `http://modules:8080` |
+| MODULE_SERVICE_CONNECT_TIMEOUT_MILLIS | optional | 2000 | TCP connect bound per call to the module service |
+| MODULE_SERVICE_READ_TIMEOUT_MILLIS | optional | 3000 | response bound per call                        |
+| MODULE_SERVICE_RETRY_MAX_ATTEMPTS | optional | 3    | attempts per call on connection failures, timeouts and 5xx; 4xx are never retried |
+| MODULE_SERVICE_RETRY_WAIT_MILLIS | optional | 200   | wait between attempts                          |
+| MODULE_SERVICE_CIRCUIT_BREAKER_WAIT_IN_OPEN_STATE_MILLIS | optional | 10000 | time the breaker stays open after tripping (sliding window of 10 calls, at least 5, failure rate 50 %) |
 | BIND_ADDR                    | optional | 0.0.0.0 |                                                    |
 | LOG_LEVEL                    | optional | info    | trace/debug/info/warn/error                        |
 | LOG_FORMAT                   | optional | json    | json (ECS structured) or text                      |
@@ -97,7 +106,8 @@ percentile-histogram boundaries between 1 ms and 30 s; `histogram_quantile()` wo
 | `tomcat_connections_current_connections`, `tomcat_connections_config_max_connections`, `tomcat_threads_busy_threads`, `tomcat_threads_current_threads`, `tomcat_threads_config_max_threads` | gauge | `name` = `http-nio-0.0.0.0-8080` (connector) | Tomcat connector saturation under Micrometer's Tomcat names, read from the connector itself: the MBean-based Tomcat binder (`server.tomcat.mbeanregistry.enabled`) is off — with the registry on, the native image cannot start Tomcat (GraalVM reflection metadata of the connector introspection is conditional on it), so `tomcat_global_*`, `tomcat_servlet_*`, `tomcat_cache_*` and the keep-alive gauge are not served |
 
 `uri` values (stable enumeration): `/users/register`, `/users/login`, `/users/me`, `/users`,
-`/users/{id}` for the routes of the API — recorded for every request to a known route, including
+`/users/{id}`, `/users/{id}/modules/{moduleId}`, `/modules` for the routes of the API — recorded
+for every request to a known route, including
 the ones the security chain rejects with 401/403 and the login route the security filter answers
 itself (the image announces the template on the request observation, Micrometer alone would
 record `UNKNOWN` for those) — plus Micrometer's own fallbacks `NOT_FOUND` (404), `REDIRECTION`
@@ -108,6 +118,27 @@ request. Note (upstream behaviour): the stateless security chain answers 403 for
 requests, and error responses (404, 500, ...) are re-dispatched to Spring's `/error` handler which
 the same chain rejects, so the client sees 403 while the metrics and the access log record the
 status of the original request (404, 500, ...).
+
+### Modules hop (client side of backend -> modules)
+| Family | Type | Labels | Meaning |
+|---|---|---|---|
+| `http_client_requests_seconds_{count,sum,bucket}` | histogram | `peer` = `modules`, `method`, `uri`, `status`, `outcome`, `error` | every call to the module service, retries included, by the module service's own route template (`/api/v1/modules`, `/api/v1/modules/{module_id}`); Micrometer's RestClient observation with its `client.name` host label replaced by `peer`; shared buckets; `http_client_requests_seconds_max` is the per-interval maximum |
+| `http_client_requests_active` | gauge | `peer`, `method`, `uri` | calls awaiting a response (`UNKNOWN` for a path outside the module service's route table) |
+| `http_client_request_bytes_total`, `http_client_response_bytes_total` | counter | `peer`, `uri` | body bytes sent / received (received as announced by `Content-Length`); pre-created at 0 per route |
+
+Latency note (upstream behaviour, unchanged by the image): every authenticated request loads
+the caller by id in the JWT filter, and Hibernate renders that load as one statement of about
+thirty left joins (the audit references `created_by` / `last_modified_by` are users themselves,
+joined eagerly with their roles and authorities two levels deep), which PostgreSQL plans and
+executes in roughly 1.1 to 1.3 s. Anonymous requests and the login route are not affected. The
+module assignments are fetched by a separate select so that they stay out of that join.
+
+The module service is deliberately not a health check: its outage degrades into `503` answers
+on the module endpoints while the backend stays ready for everything else. A module is assigned
+only after `GET /api/v1/modules/{id}` answered 200; the module service's 4xx status and body pass
+through to the caller (404 unknown module, 409 duplicate code on create); connection failures,
+timeouts and 5xx are retried up to `MODULE_SERVICE_RETRY_MAX_ATTEMPTS` times and, like an open
+circuit breaker, end in `503` with a `ResponseError` body. The breaker's own state is not exported.
 
 ### Database hop (Micrometer binders)
 | Family | Type | Labels | Meaning |
@@ -158,7 +189,8 @@ Errors add `error.type`, `error.message`, `error.stack_trace`.
 
 Request id: the `X-Request-Id` request header is accepted when it is 1–128 characters of
 `[A-Za-z0-9._-]`, otherwise a lowercase UUIDv4 is generated; it is echoed in the `X-Request-Id`
-response header and is the correlation key across proxy, frontend and backend logs.
+response header, forwarded to the module service on every call of the modules hop, and is the
+correlation key across proxy, frontend, backend and module-service logs.
 
 Domain events (`log.level` `info`, `log.logger` = the emitting class):
 
@@ -189,6 +221,9 @@ response bodies, query strings, client addresses, emails.
 - Init required: no
 - Capabilities required: none; no privilege escalation
 - PID 1 exception: none — the native binary is PID 1 via exec-form ENTRYPOINT
+- Module service: `MODULE_SERVICE_URL` must reach the module service's Service (the chart wires
+  `<release>-modules:8080`); the `users_module` table that holds assignments is created like the
+  other tables through `SPRING_JPA_HIBERNATE_DDL_AUTO`
 - Database schema: no migrations ship with the app; schema handling is entirely
   `SPRING_JPA_HIBERNATE_DDL_AUTO`. The application itself never creates the `USER_MODIFY` /
   `USER_DELETE` authorities the PUT/DELETE endpoints require, nor assigns a role to a user;

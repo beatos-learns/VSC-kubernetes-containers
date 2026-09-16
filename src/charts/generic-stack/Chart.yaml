@@ -1,7 +1,7 @@
 apiVersion: v2
 name: generic-stack
-description: Generic umbrella chart that deploys a values-defined set of container-build-standard components (default set - db, backend, frontend, proxy)
+description: Generic umbrella chart that deploys a values-defined set of container-build-standard components (default set - db, backend, frontend, modules, proxy)
 type: application
-version: 0.0.4
+version: 0.0.5
 appVersion: "0.0.1"
 kubeVersion: ">=1.25.0-0"

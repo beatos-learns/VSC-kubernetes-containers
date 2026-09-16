@@ -1,5 +1,5 @@
 diff --git a/build.gradle b/build.gradle
-index c561d45..1da124e 100644
+index d998130..b0b72db 100644
 --- a/build.gradle
 +++ b/build.gradle
 @@ -1,6 +1,7 @@
@@ -19,7 +19,7 @@ index c561d45..1da124e 100644
      implementation group: 'org.postgresql', name: 'postgresql', version: '42.7.10'
      implementation group: 'commons-validator', name: 'commons-validator', version: '1.10.1'
      implementation group: 'io.jsonwebtoken', name: 'jjwt-api', version: '0.13.0'
-@@ -39,3 +42,22 @@ dependencies {
+@@ -42,3 +45,22 @@ dependencies {
  tasks.named('test') {
      useJUnitPlatform()
  }
@@ -161,21 +161,21 @@ index 6090536..cb92354 100644
    }
  
 diff --git a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
-index 60fffa5..9c3b9e3 100644
+index 2cde2b2..1064619 100644
 --- a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
 +++ b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
-@@ -1,7 +1,10 @@
- package com.example.jwt.domain.user;
+@@ -2,8 +2,10 @@ package com.example.jwt.domain.user;
  
  import com.example.jwt.core.generic.ExtendedServiceImpl;
+ import com.example.jwt.domain.module.ModuleServiceClient;
 +import java.util.NoSuchElementException;
-+import java.util.UUID;
+ import java.util.UUID;
  import org.slf4j.Logger;
 +import org.springframework.dao.DataIntegrityViolationException;
  import org.springframework.security.core.userdetails.UserDetails;
  import org.springframework.security.core.userdetails.UsernameNotFoundException;
  import org.springframework.security.crypto.password.PasswordEncoder;
-@@ -27,6 +30,42 @@ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserSe
+@@ -31,7 +33,43 @@ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserSe
    @Override
    public User register(User user) {
      user.setPassword(passwordEncoder.encode(user.getPassword()));
@@ -218,7 +218,8 @@ index 60fffa5..9c3b9e3 100644
 +        .log("user deleted");
 +    return null;
    }
- }
+ 
+   @Override
 diff --git a/src/main/java/com/example/jwt/ops/AdminServer.java b/src/main/java/com/example/jwt/ops/AdminServer.java
 new file mode 100644
 index 0000000..21582c8
@@ -697,6 +698,103 @@ index 0000000..7c2e3e9
 +    return fresh(config, nowMillis) && snapshot.get().allOk() && !draining;
 +  }
 +}
+diff --git a/src/main/java/com/example/jwt/ops/ModuleClientInstrumentation.java b/src/main/java/com/example/jwt/ops/ModuleClientInstrumentation.java
+new file mode 100644
+index 0000000..2359c00
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/ModuleClientInstrumentation.java
+@@ -0,0 +1,91 @@
++package com.example.jwt.ops;
++
++import io.micrometer.core.instrument.Counter;
++import io.micrometer.core.instrument.Gauge;
++import io.micrometer.core.instrument.MeterRegistry;
++import java.io.IOException;
++import java.util.List;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.slf4j.MDC;
++import org.springframework.http.HttpRequest;
++import org.springframework.http.client.ClientHttpRequestExecution;
++import org.springframework.http.client.ClientHttpRequestInterceptor;
++import org.springframework.http.client.ClientHttpResponse;
++
++/**
++ * The client side of the backend -> modules hop: forwards the request id of
++ * the request being served, and keeps the in-flight gauge and byte counters
++ * per route template of the module service (the peer's own {@code uri}
++ * values). Micrometer's RestClient observation supplies the timer.
++ */
++public final class ModuleClientInstrumentation implements ClientHttpRequestInterceptor {
++
++  public static final String PEER = "modules";
++
++  private static final List<String> ROUTES = List.of("/api/v1/modules", "/api/v1/modules/{module_id}");
++
++  private final MeterRegistry registry;
++  private final ConcurrentHashMap<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
++
++  public ModuleClientInstrumentation(MeterRegistry registry) {
++    this.registry = registry;
++    for (String uri : ROUTES) {
++      counter("http.client.request.bytes", "Request body bytes sent to a peer component.", uri);
++      counter("http.client.response.bytes", "Response body bytes received from a peer component.", uri);
++    }
++    counter("http.client.request.bytes", "Request body bytes sent to a peer component.", RouteTemplates.UNKNOWN);
++    counter("http.client.response.bytes", "Response body bytes received from a peer component.", RouteTemplates.UNKNOWN);
++  }
++
++  @Override
++  public ClientHttpResponse intercept(HttpRequest request, byte[] body, ClientHttpRequestExecution execution)
++      throws IOException {
++    String requestId = MDC.get(RequestMetricsFilter.MDC_REQUEST_ID);
++    if (requestId != null && request.getHeaders().getFirst(RequestMetricsFilter.REQUEST_ID_HEADER) == null) {
++      request.getHeaders().set(RequestMetricsFilter.REQUEST_ID_HEADER, requestId);
++    }
++    String uri = template(request.getURI().getPath());
++    AtomicInteger active = inFlight(request.getMethod().name(), uri);
++    active.incrementAndGet();
++    try {
++      ClientHttpResponse response = execution.execute(request, body);
++      counter("http.client.request.bytes", "Request body bytes sent to a peer component.", uri).increment(body.length);
++      long length = response.getHeaders().getContentLength();
++      if (length > 0) {
++        counter("http.client.response.bytes", "Response body bytes received from a peer component.", uri)
++            .increment(length);
++      }
++      return response;
++    } finally {
++      active.decrementAndGet();
++    }
++  }
++
++  /** The module service's route template for a request path, else UNKNOWN. */
++  static String template(String path) {
++    if (ROUTES.get(0).equals(path)) {
++      return ROUTES.get(0);
++    }
++    if (path != null && path.startsWith("/api/v1/modules/") && path.length() > 16 && path.indexOf('/', 16) < 0) {
++      return ROUTES.get(1);
++    }
++    return RouteTemplates.UNKNOWN;
++  }
++
++  private AtomicInteger inFlight(String method, String uri) {
++    return inFlight.computeIfAbsent(method + " " + uri, key -> {
++      AtomicInteger counter = new AtomicInteger();
++      Gauge.builder("http.client.requests.active", counter, AtomicInteger::get)
++          .description("Calls to a peer component currently in flight.")
++          .tag("peer", PEER).tag("method", method).tag("uri", uri)
++          .register(registry);
++      return counter;
++    });
++  }
++
++  private Counter counter(String name, String description, String uri) {
++    return Counter.builder(name).description(description).baseUnit("bytes")
++        .tag("peer", PEER).tag("uri", uri).register(registry);
++  }
++}
 diff --git a/src/main/java/com/example/jwt/ops/OpenMetricsExposition.java b/src/main/java/com/example/jwt/ops/OpenMetricsExposition.java
 new file mode 100644
 index 0000000..27b3616
@@ -934,25 +1032,30 @@ index 0000000..e222b12
 +}
 diff --git a/src/main/java/com/example/jwt/ops/OpsBootstrap.java b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
 new file mode 100644
-index 0000000..e48ffd6
+index 0000000..91aa35d
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,148 @@
 +package com.example.jwt.ops;
 +
 +import com.example.jwt.core.security.helpers.Credentials;
++import com.example.jwt.domain.module.ModuleDTO;
 +import io.micrometer.core.instrument.Meter;
 +import io.micrometer.core.instrument.MeterRegistry;
++import io.micrometer.core.instrument.Tag;
 +import io.micrometer.core.instrument.config.MeterFilter;
 +import io.micrometer.core.instrument.config.MeterFilterReply;
 +import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 +import java.sql.Connection;
 +import java.sql.Statement;
++import java.util.ArrayList;
++import java.util.List;
 +import javax.sql.DataSource;
 +import org.slf4j.Logger;
 +import org.slf4j.LoggerFactory;
 +import org.springframework.aot.hint.annotation.RegisterReflectionForBinding;
 +import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.boot.restclient.RestClientCustomizer;
 +import org.springframework.boot.tomcat.TomcatWebServer;
 +import org.springframework.boot.web.server.context.WebServerApplicationContext;
 +import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -972,7 +1075,7 @@ index 0000000..e48ffd6
 + */
 +@Configuration(proxyBeanMethods = false)
 +@ImportRuntimeHints(OpsRuntimeHints.class)
-+@RegisterReflectionForBinding(Credentials.class)
++@RegisterReflectionForBinding({Credentials.class, ModuleDTO.class})
 +public class OpsBootstrap {
 +
 +  private static final Logger log = LoggerFactory.getLogger(OpsBootstrap.class);
@@ -995,21 +1098,43 @@ index 0000000..e48ffd6
 +    return new MeterFilter() {
 +      @Override
 +      public Meter.Id map(Meter.Id id) {
-+        return "system.cpu.count".equals(id.getName()) ? id.withName("system.cpus") : id;
++        if ("system.cpu.count".equals(id.getName())) {
++          return id.withName("system.cpus");
++        }
++        if ("http.client.requests".equals(id.getName())) {
++          List<Tag> tags = new ArrayList<>();
++          for (Tag tag : id.getTagsAsIterable()) {
++            if (!"client.name".equals(tag.getKey())) {
++              tags.add(tag);
++            }
++          }
++          tags.add(Tag.of("peer", ModuleClientInstrumentation.PEER));
++          return id.replaceTags(tags);
++        }
++        return id;
 +      }
 +
 +      /**
-+       * Micrometer's long task timer for http.server.requests is tagged when the
-+       * observation starts, before any route is known, so its uri is always
-+       * UNKNOWN; the image serves the plain http_server_requests_active gauge
-+       * instead (RequestMetricsFilter), the same family as the other images.
++       * Micrometer's long task timers for http.server.requests and
++       * http.client.requests are tagged when the observation starts, before the
++       * server route is known; the image serves the plain *_requests_active
++       * gauges instead (RequestMetricsFilter, ModuleClientInstrumentation), the
++       * same families as the other images.
 +       */
 +      @Override
 +      public MeterFilterReply accept(Meter.Id id) {
-+        return "http.server.requests.active".equals(id.getName()) && id.getType() == Meter.Type.LONG_TASK_TIMER
-+            ? MeterFilterReply.DENY : MeterFilterReply.NEUTRAL;
++        boolean longTask = id.getType() == Meter.Type.LONG_TASK_TIMER
++            && ("http.server.requests.active".equals(id.getName())
++                || "http.client.requests.active".equals(id.getName()));
++        return longTask ? MeterFilterReply.DENY : MeterFilterReply.NEUTRAL;
 +      }
 +    };
++  }
++
++  /** The backend -> modules hop: request-id forwarding, in-flight gauge, byte counters. */
++  @Bean
++  public RestClientCustomizer moduleClientInstrumentation(MeterRegistry registry) {
++    return builder -> builder.requestInterceptor(new ModuleClientInstrumentation(registry));
 +  }
 +
 +  @Bean
@@ -1558,10 +1683,10 @@ index 0000000..d690e80
 +}
 diff --git a/src/main/java/com/example/jwt/ops/RouteTemplates.java b/src/main/java/com/example/jwt/ops/RouteTemplates.java
 new file mode 100644
-index 0000000..4a907e9
+index 0000000..1082011
 --- /dev/null
 +++ b/src/main/java/com/example/jwt/ops/RouteTemplates.java
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,102 @@
 +package com.example.jwt.ops;
 +
 +import jakarta.servlet.http.HttpServletRequest;
@@ -1597,12 +1722,20 @@ index 0000000..4a907e9
 +        return "GET".equals(method) ? "/users/me" : null;
 +      case "/users":
 +        return "GET".equals(method) ? "/users" : null;
++      case "/modules":
++        return "GET".equals(method) || "POST".equals(method) ? "/modules" : null;
 +      default:
 +        break;
 +    }
 +    if (path.startsWith("/users/") && path.length() > 7 && path.indexOf('/', 7) < 0
 +        && ("GET".equals(method) || "PUT".equals(method) || "DELETE".equals(method))) {
 +      return "/users/{id}";
++    }
++    if (path.startsWith("/users/") && ("POST".equals(method) || "DELETE".equals(method))) {
++      String[] parts = path.substring(7).split("/");
++      if (parts.length == 3 && "modules".equals(parts[1]) && !parts[0].isEmpty() && !parts[2].isEmpty()) {
++        return "/users/{id}/modules/{moduleId}";
++      }
 +    }
 +    return null;
 +  }
@@ -1795,10 +1928,10 @@ index 0000000..934d221
 +  }
 +}
 diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
-index b15ef16..a932796 100644
+index b15ef16..73f88fe 100644
 --- a/src/main/resources/application.properties
 +++ b/src/main/resources/application.properties
-@@ -4,9 +4,26 @@ spring.datasource.password=${SPRING_DATASOURCE_PASSWORD}
+@@ -4,9 +4,28 @@ spring.datasource.password=${SPRING_DATASOURCE_PASSWORD}
  spring.datasource.driver-class-name=org.postgresql.Driver
  
  spring.jpa.hibernate.ddl-auto=${SPRING_JPA_HIBERNATE_DDL_AUTO}
@@ -1828,3 +1961,5 @@ index b15ef16..a932796 100644
 +management.metrics.enable.jvm.compilation=false
 +management.metrics.enable.process.cpu.time=false
 +management.metrics.enable.system.cpu.usage=false
++management.metrics.distribution.percentiles-histogram.http.client.requests=true
++management.metrics.distribution.slo.http.client.requests=5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s,10s
