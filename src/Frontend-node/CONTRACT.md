@@ -20,7 +20,9 @@ the build and patched with `patches/0001-runtime-injectable-config.patch`. The p
 environment-neutral: the backend URL is the runtime env `API_URL` (server-side only, not the
 build-time-inlined `NEXT_PUBLIC_API_URL`), the signup call is proxied through `/api/signup` so the
 browser only ever talks same-origin, the jwt cookie `secure` flag is env-derived (`COOKIE_SECURE`),
-the avatar is a local asset instead of a third-party CDN one, and `output: 'standalone'` is enabled.
+the avatar is a local asset instead of a third-party CDN one, `output: 'standalone'` is enabled, and
+`package.json` plus the pnpm lockfile pin next 16.3.5 (with sharp 0.35.4) in place of the upstream
+next 16.2.4.
 
 Base: `gcr.io/distroless/nodejs24-debian13` (digest-pinned) — documented exception to the base
 policy: a purpose-built runtime image chosen for the Node.js environment it ships. The final image

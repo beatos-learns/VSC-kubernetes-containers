@@ -28,7 +28,7 @@ RUN pnpm build
 RUN install -d -m 1777 /src/.next/standalone/.next/cache
 
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/nodejs24-debian13@sha256:2e3b3a96d1d7286c3e4727f9c84b4dc32b6b33e7d7d4425c5a5c8186ad85fa93
+FROM gcr.io/distroless/nodejs24-debian13@sha256:b1fc33242cc74151f50c62b4a03d48afd759dccf81279b5f8e401db4546479c1
 ARG APP_UID
 ARG APP_GID
 ARG VERSION

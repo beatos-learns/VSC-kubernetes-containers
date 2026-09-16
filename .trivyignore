@@ -6,18 +6,3 @@
 # runtime stage installs nothing and no rebuilt 10-micro digest is published).
 CVE-2026-54369 exp:2026-10-31
 CVE-2026-54370 exp:2026-10-31
-
-# auth-portal:0.0.2-node (alternative Node.js variant, not deployed by the Ops
-# repo): next 16.2.4 + sharp 0.34.5 from the pinned upstream lockfile.
-CVE-2026-44573 exp:2026-10-31
-CVE-2026-44574 exp:2026-10-31
-CVE-2026-44575 exp:2026-10-31
-CVE-2026-44578 exp:2026-10-31
-CVE-2026-44579 exp:2026-10-31
-CVE-2026-45109 exp:2026-10-31
-CVE-2026-64641 exp:2026-10-31
-CVE-2026-64642 exp:2026-10-31
-CVE-2026-64645 exp:2026-10-31
-CVE-2026-64649 exp:2026-10-31
-GHSA-8h8q-6873-q5fj exp:2026-10-31
-GHSA-f88m-g3jw-g9cj exp:2026-10-31
