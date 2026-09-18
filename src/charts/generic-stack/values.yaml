@@ -220,7 +220,7 @@ components:
   backend:
     image:
       repository: user-mgmt-service
-      tag: "0.0.4"
+      tag: "0.0.5"
     security:
       uid: 10021
       gid: 10021

@@ -1,6 +1,6 @@
 # user-mgmt-service — image contract
 
-Image: localhost/user-mgmt-service:0.0.4 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
+Image: localhost/user-mgmt-service:0.0.5 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
 registry — the OCI version label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10021:10021 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (the native binary serves endpoints, checker loop, signals, probe subcommand)
@@ -197,7 +197,7 @@ Domain events (`log.level` `info`, `log.logger` = the emitting class):
 | `event.action` | `event.outcome` | extra fields | when |
 |---|---|---|---|
 | `user.register` | `success` | `user.id` | a user was created |
-| `user.register` | `failure` | `reason` = `duplicate-email` | the email is already registered |
+| `user.register` | `failure` | `reason` = `duplicate-email` | the email is already registered; the client receives 409 Conflict |
 | `user.login` | `success` | `user.id` | credentials accepted, token issued |
 | `user.login` | `failure` | `reason` = `bad-credentials` / `unknown-user` / `other` | wrong password / no such user / any other authentication error (the client always receives 401) |
 | `user.delete` | `success` / `failure` | `user.id`, `reason` = `unknown-user` on failure | a user was deleted / the id does not exist |

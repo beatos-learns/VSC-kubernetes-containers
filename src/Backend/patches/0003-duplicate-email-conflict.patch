@@ -1,0 +1,73 @@
+diff --git a/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java b/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
+index 1dea44c..d34e675 100644
+--- a/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
++++ b/src/main/java/com/example/jwt/core/exception/CustomGlobalExceptionHandler.java
+@@ -5,6 +5,7 @@ import java.time.LocalDate;
+ import java.util.Map;
+ import java.util.NoSuchElementException;
+ import java.util.stream.Collectors;
++import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.MediaType;
+ import org.springframework.http.ResponseEntity;
+@@ -36,6 +37,22 @@ public class CustomGlobalExceptionHandler {
+         .setErrors(Map.of("id", ex.getMessage())).build();
+   }
+ 
++  @ExceptionHandler(DuplicateEmailException.class)
++  @ResponseStatus(value = HttpStatus.CONFLICT)
++  public ResponseError handleDuplicateEmail(DuplicateEmailException ex) {
++    return new ResponseError().setTimeStamp(LocalDate.now())
++        .setErrors(Map.of("email", ex.getMessage())).build();
++  }
++
++  // Any other unique or foreign key violation: the request conflicts with
++  // existing data, which is the client's to resolve, not a server fault.
++  @ExceptionHandler(DataIntegrityViolationException.class)
++  @ResponseStatus(value = HttpStatus.CONFLICT)
++  public ResponseError handleDataIntegrityViolation(DataIntegrityViolationException ex) {
++    return new ResponseError().setTimeStamp(LocalDate.now())
++        .setErrors(Map.of("data", "conflicts with existing data")).build();
++  }
++
+   @ExceptionHandler(HttpClientErrorException.class)
+   public ResponseEntity<String> handleModuleServiceClientError(HttpClientErrorException ex) {
+     return ResponseEntity.status(ex.getStatusCode()).contentType(MediaType.APPLICATION_JSON)
+diff --git a/src/main/java/com/example/jwt/core/exception/DuplicateEmailException.java b/src/main/java/com/example/jwt/core/exception/DuplicateEmailException.java
+new file mode 100644
+index 0000000..021baa0
+--- /dev/null
++++ b/src/main/java/com/example/jwt/core/exception/DuplicateEmailException.java
+@@ -0,0 +1,12 @@
++package com.example.jwt.core.exception;
++
++/**
++ * Registration with an email that is already registered. Mapped to 409
++ * Conflict by {@link CustomGlobalExceptionHandler}.
++ */
++public class DuplicateEmailException extends RuntimeException {
++
++  public DuplicateEmailException(String email) {
++    super(email + " is already registered");
++  }
++}
+diff --git a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+index 1064619..b6e5634 100644
+--- a/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
++++ b/src/main/java/com/example/jwt/domain/user/UserServiceImpl.java
+@@ -1,5 +1,6 @@
+ package com.example.jwt.domain.user;
+ 
++import com.example.jwt.core.exception.DuplicateEmailException;
+ import com.example.jwt.core.generic.ExtendedServiceImpl;
+ import com.example.jwt.domain.module.ModuleServiceClient;
+ import java.util.NoSuchElementException;
+@@ -47,7 +48,7 @@ public class UserServiceImpl extends ExtendedServiceImpl<User> implements UserSe
+           .addKeyValue("event.outcome", "failure")
+           .addKeyValue("reason", "duplicate-email")
+           .log("user registration rejected");
+-      throw e;
++      throw new DuplicateEmailException(user.getEmail());
+     }
+   }
+ 
