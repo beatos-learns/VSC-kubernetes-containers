@@ -1,6 +1,6 @@
 # user-mgmt-service — image contract
 
-Image: localhost/user-mgmt-service:0.0.5 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
+Image: localhost/user-mgmt-service:0.0.6 (user_mgmt_service 0.0.1-SNAPSHOT; retag for your
 registry — the OCI version label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10021:10021 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (the native binary serves endpoints, checker loop, signals, probe subcommand)
@@ -8,12 +8,16 @@ Checker runtime: none — in-process
 Layer format: OCI, zstd:chunked (applied at push, see Publishing)
 
 Source: `github.com/yagan93/user_mgmt_service` @ `747b7f4e3d1f09cc4434a75d9c991ea091fda548`, cloned during the build and
-patched, in order, with `patches/0001-module-assignment.patch` (the module feature, written as an
-upstream pull request: the `/modules` proxy endpoints, module assignment on users, and the
-module-service client with timeouts, retry and circuit breaker) and
+patched, in file-name order, with `patches/0001-module-assignment.patch` (the module feature,
+written as an upstream pull request: the `/modules` proxy endpoints, module assignment on users,
+and the module-service client with timeouts, retry and circuit breaker),
 `patches/0002-container-build-standard.patch` (health/ops machinery, graceful shutdown, GraalVM
 native build config, Micrometer/Actuator metrics served on the admin port, request-id correlation,
-access log, domain events, the client-side metrics of the modules hop). Spring Boot 4.1.0-M3
+access log, domain events, the client-side metrics of the modules hop),
+`patches/0003-duplicate-email-conflict.patch` (409 for an email that is already registered),
+`patches/0004-audit-fetch-depth.patch` (the audit users of an entity are loaded by their own
+selects) and `patches/0005-database-readiness.patch` (the application starts without its
+database, see Health checks). Spring Boot 4.1.0-M3
 (pre-release milestone), Java 25, compiled with GraalVM native-image (no JVM in the image).
 
 Final base (per architecture, deliberate split):
@@ -33,7 +37,7 @@ Final base (per architecture, deliberate split):
 | SPRING_DATASOURCE_URL        | required | —       | JDBC URL, e.g. `jdbc:postgresql://db:5432/appdb`   |
 | SPRING_DATASOURCE_USERNAME   | required | —       |                                                    |
 | SPRING_DATASOURCE_PASSWORD   | required | —       | secret; upstream reads env only — inject via engine secret-to-env |
-| SPRING_JPA_HIBERNATE_DDL_AUTO| required | —       | validate / update / create / create-drop / none    |
+| SPRING_JPA_HIBERNATE_DDL_AUTO| required | —       | validate / update / create / create-drop / none; applied once the database answers, not during startup (see Health checks) |
 | JWT_ISSUER                   | required | —       | issuer claim of issued tokens                      |
 | JWT_SECRET                   | required | —       | secret; Base64, must decode to >= 256 bits (HMAC)  |
 | JWT_EXPIRATION_MILLIS        | required | —       | token lifetime in milliseconds                     |
@@ -47,7 +51,7 @@ Final base (per architecture, deliberate split):
 | LOG_LEVEL                    | optional | info    | trace/debug/info/warn/error                        |
 | LOG_FORMAT                   | optional | json    | json (ECS structured) or text                      |
 | ACCESS_LOG                   | optional | false   | one JSON line per request on PORT (see Logs); never for ADMIN_PORT hits |
-| HEALTH_CHECK_INTERVAL        | optional | 5 s     | sized for a fast API in front of a local database  |
+| HEALTH_CHECK_INTERVAL        | optional | 5 s     | sized for a fast API in front of a local database; also the retry interval of the schema action |
 | HEALTH_CHECK_TIMEOUT         | optional | 2 s     | must be < interval (validated at startup)          |
 | HEALTH_STALE_FACTOR          | optional | 3       | snapshot older than factor x interval => not alive |
 | SHUTDOWN_DRAIN_DELAY         | optional | 3 s     | lets the proxy discover not-ready before refusal   |
@@ -55,17 +59,30 @@ Final base (per architecture, deliberate split):
 
 Startup validates the whole configuration; a missing required value or an invariant violation logs one
 clear error and exits non-zero immediately. After a successful start one line logs name, version,
-revision, and the effective non-secret configuration.
+revision, and the effective non-secret configuration. The database is not part of startup: the
+process starts and stays up while the database is unreachable, refuses the credentials or lacks the
+schema, keeps retrying, and reports it on `/readyz` (see Health checks).
 
 ## Health checks registered
-| Check          | Verifies                                                        |
-|----------------|-----------------------------------------------------------------|
-| spring-context | application context finished starting                           |
-| database       | `SELECT 1` on the connection pool                               |
+| Check          | Kind       | Verifies                                                        |
+|----------------|------------|-----------------------------------------------------------------|
+| spring-context | self       | application context finished starting                           |
+| database       | dependency | `SELECT 1` on the connection pool                               |
+| schema         | dependency | the schema action of SPRING_JPA_HIBERNATE_DDL_AUTO has been applied (`validate` passed, `update` / `create` ran; `none` passes at once) |
 
-`/startupz` latches on the first cycle in which every registered check passes — including the
-database check, so a database that is unreachable at boot delays startup completion (size startup
-probe budgets accordingly). Both checks gate `/readyz`; neither ever gates `/livez` (staleness only).
+`/startupz` latches on the first checker cycle after the application context is ready (the context
+starts in well under a second); the database is never a startup condition. The dependency checks
+gate `/readyz` only, never `/startupz` or `/livez` (staleness only): an unreachable database, refused
+credentials or a missing schema take the pod out of load balancing, and the container is never
+restarted for it.
+
+The application context starts without a database connection. Hibernate boots without JDBC
+metadata and generates SQL for its PostgreSQL baseline (13, accepted by every supported server; the
+startup log's `Database version: 13.0` names that baseline, not the server), and the connection pool
+starts empty and connects in the background. The schema action runs once the context is ready and is
+retried every HEALTH_CHECK_INTERVAL until the database accepts it, so `validate` against a schema
+that does not match yet keeps the service not-ready until it does; `create-drop` drops its tables
+when the process stops.
 
 Probe command: `/app/user-mgmt-service healthcheck --endpoint=<startupz|livez|readyz>` (exit 0/1);
 it targets 127.0.0.1 for wildcard binds, otherwise the configured BIND_ADDR.
@@ -89,7 +106,7 @@ percentile-histogram boundaries between 1 ms and 30 s; `histogram_quantile()` wo
 | Family | Type | Labels | Meaning |
 |---|---|---|---|
 | `build_info` | gauge | `version`, `revision` | always 1; packaged-software version and VCS revision of the running artifact |
-| `health_check_up` | gauge | `check` = `spring-context`, `database` | 1 = the check passed in the last checker cycle |
+| `health_check_up` | gauge | `check` = `spring-context`, `database`, `schema` | 1 = the check passed in the last checker cycle |
 | `health_check_duration_seconds` | gauge | `check` | duration of the last run of that check |
 | `health_check_last_success_timestamp_seconds` | gauge | `check` | unix time of the last pass; 0 until the check first passed |
 | `health_snapshot_age_seconds` | gauge | — | age of the cached snapshot the probes read (staleness = liveness) |
@@ -209,7 +226,9 @@ never the raw path), `http.response.status_code`, `event.duration` (integer nano
 `http.request.bytes`, `http.response.bytes`. Never written for admin-port (probe, metrics) hits.
 
 Startup: one line logs name, version, revision and the effective non-secret configuration; health
-check transitions and the drain sequence are logged at `info`. Hibernate SQL echo (`show-sql`) is off, so
+check transitions, the applied schema action and the drain sequence are logged at `info`, a schema
+action that fails at `warn` (once per distinct cause while it is retried; Hibernate adds its own
+`warn` lines for the failed connection). Hibernate SQL echo (`show-sql`) is off, so
 stdout carries nothing but JSON lines.
 
 Never logged: passwords, tokens, the `Authorization` header or any other header, request or
@@ -225,13 +244,15 @@ response bodies, query strings, client addresses, emails.
   `<release>-modules:8080`); the `users_module` table that holds assignments is created like the
   other tables through `SPRING_JPA_HIBERNATE_DDL_AUTO`
 - Database schema: no migrations ship with the app; schema handling is entirely
-  `SPRING_JPA_HIBERNATE_DDL_AUTO`. The application itself never creates the `USER_MODIFY` /
-  `USER_DELETE` authorities the PUT/DELETE endpoints require, nor assigns a role to a user;
-  the deployment seeds both through the db image's init-script mechanism.
+  `SPRING_JPA_HIBERNATE_DDL_AUTO`, applied once the database answers. The application itself
+  never creates the `USER_MODIFY` / `USER_DELETE` authorities the PUT/DELETE endpoints require,
+  nor assigns a role to a user; the deployment seeds both through the db image's init-script
+  mechanism.
 
 ## Exit codes
-0 clean shutdown · 1 drain deadline exceeded or fatal error · (137 observed = SIGKILL,
-grace period granted was below the documented requirement)
+0 clean shutdown · 1 drain deadline exceeded, or a fatal startup error (invalid configuration, an
+application context that fails to start; an unavailable database is not one) · (137 observed =
+SIGKILL, grace period granted was below the documented requirement)
 
 ## Build host requirements
 - podman with OCI image format; network to github.com, services.gradle.org, Maven Central, ghcr.io
@@ -247,5 +268,5 @@ grace period granted was below the documented requirement)
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/user-mgmt-service:0.0.3 docker://<registry>/user-mgmt-service:0.0.3
+  localhost/user-mgmt-service:0.0.6 docker://<registry>/user-mgmt-service:0.0.6
 ```

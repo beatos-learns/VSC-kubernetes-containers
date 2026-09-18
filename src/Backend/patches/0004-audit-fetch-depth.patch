@@ -1,0 +1,16 @@
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 73f88fe..4379211 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -6,6 +6,11 @@ spring.datasource.driver-class-name=org.postgresql.Driver
+ spring.jpa.hibernate.ddl-auto=${SPRING_JPA_HIBERNATE_DDL_AUTO}
+ spring.jpa.show-sql=false
+ spring.jpa.properties.hibernate.format_sql=true
++# The audit users of every entity (created_by, last_modified_by) are loaded by
++# their own selects. Joined into the entity query they multiply the eager roles
++# and authorities per user level, and a user that last modified itself makes
++# that product grow with every level.
++spring.jpa.properties.hibernate.max_fetch_depth=0
+ 
+ jwt.issuer=${JWT_ISSUER}
+ jwt.secret=${JWT_SECRET}

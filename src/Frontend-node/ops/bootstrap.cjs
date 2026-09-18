@@ -487,8 +487,13 @@ function classifyRoute(rawUrl) {
     case '/api/logout':
     case '/api/me':
     case '/api/signup':
+    case '/api/modules':
       return pathname
     default:
+  }
+  const subscription = /^\/api\/users\/([^/]+)\/modules\/([^/]+)$/.exec(pathname)
+  if (subscription && UUID_RE.test(subscription[1]) && UUID_RE.test(subscription[2])) {
+    return '/api/users/{id}/modules/{moduleId}'
   }
   if (pathname === '/dashboard' || pathname.startsWith('/dashboard/')) return '/dashboard'
   if (pathname.startsWith('/_next/') || pathname === '/favicon.ico' || publicFiles.has(pathname)) return '/static/**'
@@ -504,11 +509,16 @@ function backendRoute(pathname) {
     case '/users/login':
     case '/users/me':
     case '/users':
+    case '/modules':
       return rel
     default:
   }
   const match = /^\/users\/([^/]+)$/.exec(rel)
   if (match && UUID_RE.test(match[1])) return '/users/{id}'
+  const subscription = /^\/users\/([^/]+)\/modules\/([^/]+)$/.exec(rel)
+  if (subscription && UUID_RE.test(subscription[1]) && UUID_RE.test(subscription[2])) {
+    return '/users/{id}/modules/{moduleId}'
+  }
   return 'UNKNOWN'
 }
 
@@ -727,6 +737,13 @@ const checks = {
     })
   },
 }
+// Dependency checks gate /readyz only; the self checks gate /startupz
+// as well, so an unreachable backend never holds startup back.
+const dependencyChecks = new Set(['backend-api'])
+
+function selfChecksOk(results) {
+  return Object.keys(checks).every((name) => dependencyChecks.has(name) || results[name].ok)
+}
 
 let previousResults = {}
 async function runCycle() {
@@ -753,9 +770,9 @@ async function runCycle() {
   }))
   state.snapshot = { results, takenAt: Date.now() }
   state.cycles++
-  if (!state.started && allOk(results)) {
+  if (!state.started && selfChecksOk(results)) {
     state.started = true
-    log('info', 'startup complete: first fully successful health cycle')
+    log('info', 'startup complete: self checks passed')
   }
   for (const name of Object.keys(results)) {
     const before = previousResults[name]

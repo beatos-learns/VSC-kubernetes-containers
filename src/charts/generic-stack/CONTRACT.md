@@ -1,6 +1,6 @@
 # generic-stack — chart contract
 
-Chart: `generic-stack` 0.0.6 (retag/republish for your registry)
+Chart: `generic-stack` 0.0.7 (retag/republish for your registry)
 Artifact: OCI Helm chart, pushed to `oci://<registry>/charts` (see Publishing)
 Consumers: CD repositories (Argo CD, Flux, plain `helm upgrade --install`) that supply a
 values overlay per environment; the chart itself carries no environment-specific value.
@@ -87,7 +87,11 @@ the admin port, driven by a cached health checker and a signal-driven drain) and
 interface (ECS JSON on stdout). `templates/monitoring.yaml` configures it once for all
 components: each value below is written to a `<release>-<component>-monitoring` ConfigMap under
 the env name the image reads, and the workload consumes it via `envFrom`. `null` keeps the
-image's own default (the contracts list them per image).
+image's own default (the contracts list them per image). In every image, dependencies (a
+database, another component) gate `/readyz` only, never `/startupz` or `/livez` (repository
+README, "Probes"), so the startup and liveness probes never restart a container for an outage
+elsewhere, and the startup probe budget (`failureThreshold` × period) only has to cover the
+image's own initialization.
 
 | Key | Default | Env written | Purpose |
 |-----|---------|-------------|---------|
@@ -126,9 +130,9 @@ do-block-storage supports it) — changing the value afterwards makes the sync f
 | Component | Image | Kind | Notes |
 |-----------|-------|------|-------|
 | db | postgresql:0.0.2 (PostgreSQL 16.15) | StatefulSet | PVC at `/var/lib/postgresql` (PGDATA is created beneath it by the supervisor); password read from the mounted secret key `db-password`; `filesMountPath` preset to `/docker-entrypoint-initdb.d`, so `files` entries run as first-init SQL; `pg_*` statistics on the admin port |
-| backend | user-mgmt-service:0.0.5 | Deployment | Wired to `<release>-db` and, through `MODULE_SERVICE_URL`, to `<release>-modules:8080`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only); Micrometer route/JVM/pool metrics and the modules-hop client metrics on the admin port |
-| frontend | auth-portal:0.0.2 | Deployment | `API_URL` wired to `<release>-backend:8080`; route, backend-hop and connection metrics on the admin port, access log on by default |
-| modules | module-service:0.0.1 (module_service 0.1.0, compiled to a native binary) | Deployment | MySQL connection URL read from the mounted secret key `database-url` (`secretMount.keys` projects only that key); in-cluster only, no proxy route: the backend reaches it as `<release>-modules:8080`; route, database-hop and process metrics on the admin port |
+| backend | user-mgmt-service:0.0.6 | Deployment | Wired to `<release>-db` and, through `MODULE_SERVICE_URL`, to `<release>-modules:8080`; DB password and `JWT_SECRET` from secret keys `db-password` / `jwt-secret` (upstream reads env only); Micrometer route/JVM/pool metrics and the modules-hop client metrics on the admin port |
+| frontend | auth-portal:0.0.3 | Deployment | `API_URL` wired to `<release>-backend:8080`; route, backend-hop and connection metrics on the admin port, access log on by default |
+| modules | module-service:0.0.2 (module_service 0.1.0, compiled to a native binary) | Deployment | MySQL connection URL read from the mounted secret key `database-url` (`secretMount.keys` projects only that key); in-cluster only, no proxy route: the backend reaches it as `<release>-modules:8080`; route, database-hop and process metrics on the admin port |
 | proxy | traefik:0.0.3 (Traefik v3.7.13) | Deployment, Service type LoadBalancer (80→8080, 443→8443) | Routes via the file provider: `files.routes.yaml` ConfigMap mounted at `/etc/traefik/dynamic`, default router → frontend; `/data` is an emptyDir until `persistence.enabled` (required for ACME); Traefik's entrypoint/router/service metrics on container port 9101 (not on the Service) |
 
 ## What every deployment must supply
@@ -182,7 +186,7 @@ Not covered by rendering: the scrape itself (each image's `CONTRACT.md` lists wh
 
 ```
 helm package . --destination dist
-helm push dist/generic-stack-0.0.5.tgz oci://<registry>/charts
+helm push dist/generic-stack-0.0.7.tgz oci://<registry>/charts
 ```
 For this repository `<registry>` is `ghcr.io/beatos-learns/vsc-kubernetes-containers`; the
 CI workflow derives it from the repository name and overrides `global.imageRegistry` at

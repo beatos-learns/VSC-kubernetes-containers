@@ -1,0 +1,270 @@
+diff --git a/src/main/java/com/example/jwt/ops/DeferredSchemaAction.java b/src/main/java/com/example/jwt/ops/DeferredSchemaAction.java
+new file mode 100644
+index 0000000..7eea800
+--- /dev/null
++++ b/src/main/java/com/example/jwt/ops/DeferredSchemaAction.java
+@@ -0,0 +1,186 @@
++package com.example.jwt.ops;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import org.hibernate.SessionFactory;
++import org.hibernate.SessionFactoryObserver;
++import org.hibernate.boot.Metadata;
++import org.hibernate.boot.spi.BootstrapContext;
++import org.hibernate.cfg.JdbcSettings;
++import org.hibernate.cfg.SchemaToolingSettings;
++import org.hibernate.engine.spi.SessionFactoryImplementor;
++import org.hibernate.integrator.spi.Integrator;
++import org.hibernate.jpa.boot.spi.IntegratorProvider;
++import org.hibernate.jpa.boot.spi.JpaSettings;
++import org.hibernate.tool.schema.spi.DelayedDropAction;
++import org.hibernate.tool.schema.spi.SchemaManagementToolCoordinator;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.hibernate.autoconfigure.HibernatePropertiesCustomizer;
++import org.springframework.stereotype.Component;
++
++/**
++ * Keeps the database out of the startup path. Hibernate boots without JDBC
++ * metadata (the dialect follows from the product name) and without its schema
++ * action; the action configured through SPRING_JPA_HIBERNATE_DDL_AUTO is
++ * applied here once the application is up, retried every HEALTH_CHECK_INTERVAL
++ * until the database accepts it. It is the call Hibernate makes itself when the
++ * session factory is created, including the delayed drop of create-drop when
++ * the session factory closes. Until the action has been applied, the `schema`
++ * check keeps readiness at 503.
++ */
++@Component
++public class DeferredSchemaAction
++    implements HibernatePropertiesCustomizer, Integrator, SessionFactoryObserver {
++
++  private static final Logger log = LoggerFactory.getLogger(DeferredSchemaAction.class);
++
++  /** Every setting that has Hibernate act on the schema while the session factory is created. */
++  private static final List<String> ACTION_SETTINGS = List.of(
++      SchemaToolingSettings.JAKARTA_HBM2DDL_DATABASE_ACTION,
++      SchemaToolingSettings.HBM2DDL_AUTO,
++      SchemaToolingSettings.JAKARTA_HBM2DDL_SCRIPTS_ACTION);
++
++  private final Map<String, Object> deferred = new HashMap<>();
++  private boolean productNamed;
++  private volatile Metadata metadata;
++  private volatile SessionFactoryImplementor sessionFactory;
++  private volatile DelayedDropAction delayedDrop;
++  private volatile Thread worker;
++  private volatile boolean stopped;
++  private volatile boolean applied;
++  private volatile String detail = "schema action not started";
++
++  @Override
++  public void customize(Map<String, Object> hibernateProperties) {
++    for (String setting : ACTION_SETTINGS) {
++      Object value = hibernateProperties.remove(setting);
++      if (value != null) {
++        deferred.put(setting, value);
++      }
++    }
++    hibernateProperties.put(SchemaToolingSettings.HBM2DDL_AUTO, "none");
++    hibernateProperties.putIfAbsent(JdbcSettings.ALLOW_METADATA_ON_BOOT, false);
++    productNamed = hibernateProperties.putIfAbsent(JdbcSettings.JAKARTA_HBM2DDL_DB_NAME,
++        "PostgreSQL") == null;
++    // Without boot metadata the schema tools would look for the mapped tables in
++    // every schema; this switch has them ask their own connection for the
++    // current schema instead, as they do after a metadata boot.
++    hibernateProperties.putIfAbsent("hibernate.temp.use_jdbc_metadata_defaults", false);
++    hibernateProperties.put(JpaSettings.INTEGRATOR_PROVIDER,
++        (IntegratorProvider) () -> List.of(this));
++  }
++
++  @Override
++  public void integrate(Metadata metadata, BootstrapContext bootstrapContext,
++      SessionFactoryImplementor sessionFactory) {
++    this.metadata = metadata;
++    sessionFactory.addObserver(this);
++  }
++
++  @Override
++  public void sessionFactoryCreated(SessionFactory factory) {
++    sessionFactory = (SessionFactoryImplementor) factory;
++  }
++
++  /** Starts applying the configured action; called once the application context is ready. */
++  public void start(OpsConfig config) {
++    if (sessionFactory == null) {
++      throw new IllegalStateException("the Hibernate session factory was not created");
++    }
++    String action = action();
++    if (action == null) {
++      detail = "no schema action configured";
++      applied = true;
++      return;
++    }
++    detail = "schema action '" + action + "' not applied yet";
++    Thread thread = new Thread(() -> apply(action, config.healthCheckInterval()), "schema-action");
++    thread.setDaemon(true);
++    worker = thread;
++    thread.start();
++  }
++
++  public boolean applied() {
++    return applied;
++  }
++
++  public String detail() {
++    return detail;
++  }
++
++  private void apply(String action, int retrySeconds) {
++    String lastFailure = null;
++    for (int attempt = 1; !stopped; attempt++) {
++      try {
++        Map<String, Object> settings = new HashMap<>(sessionFactory.getProperties());
++        settings.putAll(deferred);
++        if (productNamed) {
++          // the schema tools would resolve a dialect of their own, without a
++          // version, from the product name; they use the session factory's
++          settings.remove(JdbcSettings.JAKARTA_HBM2DDL_DB_NAME);
++        }
++        SchemaManagementToolCoordinator.process(metadata, sessionFactory.getServiceRegistry(),
++            settings, drop -> delayedDrop = drop);
++        detail = "schema action '" + action + "' applied";
++        applied = true;
++        log.info("schema action '{}' applied (attempt {})", action, attempt);
++        return;
++      } catch (RuntimeException e) {
++        if (stopped) {
++          return;
++        }
++        String failure = rootCause(e);
++        detail = "schema action '" + action + "' not applied yet: " + failure;
++        if (!failure.equals(lastFailure)) {
++          log.warn("schema action '{}' failed, retrying every {}s: {}", action, retrySeconds, failure);
++          lastFailure = failure;
++        }
++      }
++      try {
++        TimeUnit.SECONDS.sleep(retrySeconds);
++      } catch (InterruptedException e) {
++        return;
++      }
++    }
++  }
++
++  @Override
++  public void sessionFactoryClosing(SessionFactory factory) {
++    stopped = true;
++    Thread thread = worker;
++    if (thread != null) {
++      thread.interrupt();
++      try {
++        thread.join(2000);
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
++    }
++    DelayedDropAction drop = delayedDrop;
++    if (drop != null) {
++      drop.perform(((SessionFactoryImplementor) factory).getServiceRegistry());
++    }
++  }
++
++  /** The configured action as the logs name it; null when there is none. */
++  private String action() {
++    for (String setting : ACTION_SETTINGS) {
++      Object value = deferred.get(setting);
++      if (value != null && !"none".equalsIgnoreCase(value.toString().trim())) {
++        return value.toString().trim();
++      }
++    }
++    return null;
++  }
++
++  private static String rootCause(Throwable failure) {
++    Throwable root = failure;
++    while (root.getCause() != null && root.getCause() != root) {
++      root = root.getCause();
++    }
++    return root.getClass().getSimpleName() + ": " + root.getMessage();
++  }
++}
+diff --git a/src/main/java/com/example/jwt/ops/HealthChecker.java b/src/main/java/com/example/jwt/ops/HealthChecker.java
+index 2eb21f0..6277aa1 100644
+--- a/src/main/java/com/example/jwt/ops/HealthChecker.java
++++ b/src/main/java/com/example/jwt/ops/HealthChecker.java
+@@ -15,7 +15,10 @@ import org.slf4j.LoggerFactory;
+ 
+ /**
+  * The single background loop owning all real checks. Endpoints only read the
+- * atomic snapshot this loop swaps in once per HEALTH_CHECK_INTERVAL.
++ * atomic snapshot this loop swaps in once per HEALTH_CHECK_INTERVAL. Startup
++ * completes with the application context; the registered checks are the
++ * service's dependencies and gate readiness only, so an unreachable database
++ * never holds startup back.
+  */
+ public final class HealthChecker implements Runnable {
+ 
+@@ -116,9 +119,9 @@ public final class HealthChecker implements Runnable {
+     HealthSnapshot next = new HealthSnapshot(Map.copyOf(results), System.currentTimeMillis());
+     state.swapSnapshot(next);
+ 
+-    if (!state.started() && next.allOk()) {
++    if (!state.started() && contextReady) {
+       state.latchStarted();
+-      log.info("startup complete: first fully successful health cycle");
++      log.info("startup complete: application context ready");
+     }
+     logTransitions(previous, results);
+   }
+diff --git a/src/main/java/com/example/jwt/ops/OpsBootstrap.java b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
+index 91aa35d..6d0e761 100644
+--- a/src/main/java/com/example/jwt/ops/OpsBootstrap.java
++++ b/src/main/java/com/example/jwt/ops/OpsBootstrap.java
+@@ -43,9 +43,12 @@ public class OpsBootstrap {
+   private static final Logger log = LoggerFactory.getLogger(OpsBootstrap.class);
+ 
+   private final DataSource dataSource;
++  private final DeferredSchemaAction schemaAction;
+ 
+-  public OpsBootstrap(DataSource dataSource, PrometheusMeterRegistry registry) {
++  public OpsBootstrap(DataSource dataSource, PrometheusMeterRegistry registry,
++      DeferredSchemaAction schemaAction) {
+     this.dataSource = dataSource;
++    this.schemaAction = schemaAction;
+     Ops.registerMeterRegistry(registry);
+   }
+ 
+@@ -139,6 +142,20 @@ public class OpsBootstrap {
+         }
+       }
+     });
++    Ops.registerCheck(new HealthCheck() {
++      @Override
++      public String name() {
++        return "schema";
++      }
++
++      @Override
++      public void run() {
++        if (!schemaAction.applied()) {
++          throw new IllegalStateException(schemaAction.detail());
++        }
++      }
++    });
++    schemaAction.start(config);
+     Ops.state().markContextReady();
+     log.info("user-mgmt-service started: version={} revision={} config[{}]",
+         System.getenv().getOrDefault("APP_VERSION", "dev"),
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 4379211..06fa46f 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -34,3 +34,6 @@ management.metrics.enable.process.cpu.time=false
+ management.metrics.enable.system.cpu.usage=false
+ management.metrics.distribution.percentiles-histogram.http.client.requests=true
+ management.metrics.distribution.slo.http.client.requests=5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s,10s
++# The pool starts without a connection and keeps connecting in the background:
++# the database gates readiness, never startup (see DeferredSchemaAction).
++spring.datasource.hikari.initialization-fail-timeout=-1

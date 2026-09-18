@@ -1,0 +1,380 @@
+diff --git a/app/dashboard/page.tsx b/app/dashboard/page.tsx
+index 8c7ac04..4454c4f 100644
+--- a/app/dashboard/page.tsx
++++ b/app/dashboard/page.tsx
+@@ -1,6 +1,7 @@
+ "use client"
+ 
+ import {AppSidebar} from "@/components/dashboard/app-sidebar"
++import {ModulesPanel} from "@/components/dashboard/modules-panel"
+ import {Button} from "@/components/ui/button"
+ import {useTheme} from "next-themes"
+ import {Moon, Sun} from "lucide-react"
+@@ -32,13 +33,13 @@ export default function Page() {
+             <Breadcrumb>
+               <BreadcrumbList>
+                 <BreadcrumbItem className="hidden md:block">
+-                  <BreadcrumbLink href="#">
++                  <BreadcrumbLink href="/dashboard">
+                     Dashboard
+                   </BreadcrumbLink>
+                 </BreadcrumbItem>
+                 <BreadcrumbSeparator className="hidden md:block" />
+                 <BreadcrumbItem>
+-                  <BreadcrumbPage>Playground</BreadcrumbPage>
++                  <BreadcrumbPage>Modules</BreadcrumbPage>
+                 </BreadcrumbItem>
+               </BreadcrumbList>
+             </Breadcrumb>
+@@ -57,12 +58,7 @@ export default function Page() {
+           </div>
+         </header>
+         <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
+-          <div className="grid auto-rows-min gap-4 md:grid-cols-3">
+-            <div className="aspect-video rounded-xl bg-muted/50" />
+-            <div className="aspect-video rounded-xl bg-muted/50" />
+-            <div className="aspect-video rounded-xl bg-muted/50" />
+-          </div>
+-          <div className="min-h-screen flex-1 rounded-xl bg-muted/50 md:min-h-min" />
++          <ModulesPanel />
+         </div>
+       </SidebarInset>
+     </SidebarProvider>
+diff --git a/components/dashboard/app-sidebar.tsx b/components/dashboard/app-sidebar.tsx
+index afca12f..771cd93 100644
+--- a/components/dashboard/app-sidebar.tsx
++++ b/components/dashboard/app-sidebar.tsx
+@@ -16,7 +16,7 @@ import {
+   SidebarMenuItem,
+ } from "@/components/ui/sidebar"
+ import { HugeiconsIcon } from "@hugeicons/react"
+-import { ComputerTerminalIcon, RoboticIcon, BookOpen02Icon, Settings05Icon, ChartRingIcon, SentIcon, CropIcon, PieChartIcon, MapsIcon, CommandIcon, SunIcon } from "@hugeicons/core-free-icons"
++import { RoboticIcon, BookOpen02Icon, Settings05Icon, ChartRingIcon, SentIcon, CropIcon, PieChartIcon, MapsIcon, CommandIcon, SunIcon } from "@hugeicons/core-free-icons"
+ import {User} from "@/models/user";
+ 
+ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+@@ -44,24 +44,18 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+ 
+   const data = {
+     user: {
+-      name: user?.firstName + " " + user?.lastName || "",
++      name: user ? `${user.firstName} ${user.lastName}` : "",
+       email: user?.email || "",
+       avatar: "/avatars/shadcn.jpg"
+     },
+     navMain: [
+       {
+-        title: "Playground",
+-        url: "#",
++        title: "Modules",
++        url: "/dashboard",
+         icon: (
+-            <HugeiconsIcon icon={ComputerTerminalIcon} strokeWidth={2} />
++            <HugeiconsIcon icon={BookOpen02Icon} strokeWidth={2} />
+         ),
+         isActive: true,
+-        items: [
+-          {
+-            title: "History",
+-            url: "#",
+-          }
+-        ],
+       }
+     ],
+     navSecondary: [
+diff --git a/components/dashboard/modules-panel.tsx b/components/dashboard/modules-panel.tsx
+new file mode 100644
+index 0000000..dfbce55
+--- /dev/null
++++ b/components/dashboard/modules-panel.tsx
+@@ -0,0 +1,261 @@
++"use client"
++
++import * as React from "react"
++import { useRouter } from "next/navigation"
++import { Badge } from "@/components/ui/badge"
++import { Button } from "@/components/ui/button"
++import {
++  Card,
++  CardAction,
++  CardContent,
++  CardDescription,
++  CardFooter,
++  CardHeader,
++  CardTitle,
++} from "@/components/ui/card"
++import { Skeleton } from "@/components/ui/skeleton"
++import type { Module } from "@/models/module"
++import type { User } from "@/models/user"
++
++type Catalog =
++  | { status: "loading" }
++  | { status: "expired" }
++  | { status: "failed"; message: string }
++  | { status: "ready"; user: User; modules: Module[] }
++
++// The backend answers a missing or expired session with 403 (401 from the
++// same-origin routes when there is no session cookie at all).
++const SESSION_GONE = new Set([401, 403])
++
++async function fetchCatalog(): Promise<Catalog> {
++  try {
++    const [me, modules] = await Promise.all([
++      fetch("/api/me", { credentials: "include" }),
++      fetch("/api/modules", { credentials: "include" }),
++    ])
++    if (SESSION_GONE.has(me.status) || SESSION_GONE.has(modules.status)) {
++      return { status: "expired" }
++    }
++    if (!me.ok) {
++      return { status: "failed", message: "Your account could not be loaded." }
++    }
++    if (!modules.ok) {
++      return {
++        status: "failed",
++        message:
++          modules.status === 503
++            ? "The module catalog is unavailable right now."
++            : "The modules could not be loaded.",
++      }
++    }
++    const user: User = await me.json()
++    const offered: Module[] = await modules.json()
++    offered.sort((a, b) => a.code.localeCompare(b.code))
++    return { status: "ready", user, modules: offered }
++  } catch {
++    return { status: "failed", message: "The modules could not be loaded." }
++  }
++}
++
++// Error bodies come from the backend ({errors: {field: message}}) or, passed
++// through it, from the module service ({code, message}).
++async function errorMessage(res: Response, fallback: string): Promise<string> {
++  try {
++    const body = await res.json()
++    if (typeof body?.message === "string") {
++      return body.message
++    }
++    const first = body?.errors ? Object.values(body.errors)[0] : undefined
++    if (typeof first === "string") {
++      return first
++    }
++  } catch {
++    // no JSON body
++  }
++  return fallback
++}
++
++function without(record: Record<string, string>, key: string) {
++  const next = { ...record }
++  delete next[key]
++  return next
++}
++
++export function ModulesPanel() {
++  const router = useRouter()
++  const [catalog, setCatalog] = React.useState<Catalog>({ status: "loading" })
++  const [pending, setPending] = React.useState<string[]>([])
++  const [failures, setFailures] = React.useState<Record<string, string>>({})
++
++  React.useEffect(() => {
++    let active = true
++    fetchCatalog().then((next) => {
++      if (active) {
++        setCatalog(next)
++      }
++    })
++    return () => {
++      active = false
++    }
++  }, [])
++
++  const retry = () => {
++    setCatalog({ status: "loading" })
++    fetchCatalog().then(setCatalog)
++  }
++
++  const logInAgain = async () => {
++    await fetch("/api/logout", { method: "POST", credentials: "include" }).catch(() => undefined)
++    router.push("/login")
++    router.refresh()
++  }
++
++  const toggle = async (user: User, module: Module, subscribed: boolean) => {
++    setPending((ids) => [...ids, module.id])
++    setFailures((current) => without(current, module.id))
++    try {
++      const res = await fetch(`/api/users/${user.id}/modules/${module.id}`, {
++        method: subscribed ? "DELETE" : "POST",
++        credentials: "include",
++      })
++      if (SESSION_GONE.has(res.status)) {
++        setCatalog({ status: "expired" })
++        return
++      }
++      if (!res.ok) {
++        const message = await errorMessage(
++          res,
++          subscribed ? "Unsubscribing failed." : "Subscribing failed."
++        )
++        setFailures((current) => ({ ...current, [module.id]: message }))
++        return
++      }
++      const updated: User = await res.json()
++      setCatalog((current) =>
++        current.status === "ready" ? { ...current, user: updated } : current
++      )
++    } catch {
++      setFailures((current) => ({
++        ...current,
++        [module.id]: "The request did not reach the server.",
++      }))
++    } finally {
++      setPending((ids) => ids.filter((id) => id !== module.id))
++    }
++  }
++
++  if (catalog.status === "loading") {
++    return (
++      <div className="flex flex-col gap-4" aria-busy="true">
++        <Skeleton className="h-6 w-40" />
++        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
++          {[0, 1, 2].map((placeholder) => (
++            <Skeleton key={placeholder} className="h-36 rounded-xl" />
++          ))}
++        </div>
++        <span className="sr-only">Loading modules…</span>
++      </div>
++    )
++  }
++
++  if (catalog.status === "expired" || catalog.status === "failed") {
++    const expired = catalog.status === "expired"
++    return (
++      <div
++        role="status"
++        className="flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center"
++      >
++        <p className="text-sm">
++          {expired ? "Your session has expired." : catalog.message}
++        </p>
++        {expired ? (
++          <Button size="lg" onClick={logInAgain}>
++            Log in again
++          </Button>
++        ) : (
++          <Button size="lg" variant="outline" onClick={retry}>
++            Try again
++          </Button>
++        )}
++      </div>
++    )
++  }
++
++  const { user, modules } = catalog
++  const subscribed = new Set(user.moduleIds ?? [])
++  const subscribedCount = modules.filter((module) => subscribed.has(module.id)).length
++
++  return (
++    <section aria-labelledby="modules-heading" className="flex flex-col gap-4">
++      <div className="flex flex-wrap items-end justify-between gap-2">
++        <div>
++          <h1 id="modules-heading" className="text-lg font-semibold">
++            Modules
++          </h1>
++          <p className="text-sm text-muted-foreground">
++            Subscribe to the modules you are taking.
++          </p>
++        </div>
++        <p className="text-sm text-muted-foreground" aria-live="polite">
++          {subscribedCount} of {modules.length} subscribed
++        </p>
++      </div>
++      {modules.length === 0 ? (
++        <p className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">
++          No modules are offered yet.
++        </p>
++      ) : (
++        <ul className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
++          {modules.map((module) => {
++            const isSubscribed = subscribed.has(module.id)
++            const busy = pending.includes(module.id)
++            const failure = failures[module.id]
++            return (
++              <li key={module.id} className="flex">
++                <Card className="w-full">
++                  <CardHeader>
++                    <CardTitle>{module.name}</CardTitle>
++                    <CardDescription>{module.code}</CardDescription>
++                    {isSubscribed ? (
++                      <CardAction>
++                        <Badge>Subscribed</Badge>
++                      </CardAction>
++                    ) : null}
++                  </CardHeader>
++                  {module.description ? (
++                    <CardContent className="text-muted-foreground">
++                      {module.description}
++                    </CardContent>
++                  ) : null}
++                  <CardFooter className="mt-auto flex-col items-stretch gap-2">
++                    <Button
++                      size="lg"
++                      variant={isSubscribed ? "outline" : "default"}
++                      disabled={busy}
++                      aria-busy={busy}
++                      aria-label={`${isSubscribed ? "Unsubscribe from" : "Subscribe to"} ${module.name}`}
++                      onClick={() => toggle(user, module, isSubscribed)}
++                    >
++                      {busy
++                        ? isSubscribed
++                          ? "Unsubscribing…"
++                          : "Subscribing…"
++                        : isSubscribed
++                          ? "Unsubscribe"
++                          : "Subscribe"}
++                    </Button>
++                    {failure ? (
++                      <p role="alert" className="text-destructive">
++                        {failure}
++                      </p>
++                    ) : null}
++                  </CardFooter>
++                </Card>
++              </li>
++            )
++          })}
++        </ul>
++      )}
++    </section>
++  )
++}
+diff --git a/models/module.ts b/models/module.ts
+new file mode 100644
+index 0000000..e56b3d9
+--- /dev/null
++++ b/models/module.ts
+@@ -0,0 +1,6 @@
++export interface Module {
++  id: string
++  code: string
++  name: string
++  description: string | null
++}
+diff --git a/models/user.ts b/models/user.ts
+index 6504e6a..535e38e 100644
+--- a/models/user.ts
++++ b/models/user.ts
+@@ -6,9 +6,11 @@ export interface UserRegisterDTO {
+ }
+ 
+ export interface User {
++  id: string
+   firstName: string
+   lastName: string
+   email: string
+   password: string
+   roles: string[]
++  moduleIds: string[]
+ }
+\ No newline at end of file

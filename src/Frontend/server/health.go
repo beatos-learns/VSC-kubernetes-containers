@@ -63,14 +63,26 @@ func allOk(results map[string]checkResult) bool {
 	return len(results) > 0
 }
 
+func selfChecksOk(checks []healthCheck, results map[string]checkResult) bool {
+	for _, check := range checks {
+		if !check.dependency && !results[check.name].OK {
+			return false
+		}
+	}
+	return true
+}
+
+// A dependency check gates /readyz only; the self checks gate /startupz
+// as well, so an unreachable backend never holds startup back.
 type healthCheck struct {
-	name string
-	run  func(ctx context.Context) error
+	name       string
+	dependency bool
+	run        func(ctx context.Context) error
 }
 
 // registeredChecks derives the checks from the service's function: the bundle
-// it serves must be present, and the backend it proxies to must be reachable
-// (any HTTP answer counts, including 401/403).
+// it serves must be present (a self check), and the backend it proxies to
+// must be reachable (a dependency; any HTTP answer counts, including 401/403).
 func registeredChecks(cfg *config) []healthCheck {
 	client := &http.Client{Timeout: cfg.checkTimeout}
 	return []healthCheck{
@@ -81,7 +93,7 @@ func registeredChecks(cfg *config) []healthCheck {
 			}
 			return nil
 		}},
-		{name: "backend-api", run: func(ctx context.Context) error {
+		{name: "backend-api", dependency: true, run: func(ctx context.Context) error {
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.apiURL+"/users", nil)
 			if err != nil {
 				return err
@@ -103,9 +115,9 @@ func checkerLoop(cfg *config, st *state, log *logger, checks []healthCheck) {
 		results := runCycle(cfg, checks, previous)
 		st.snap.Store(snapshot{Results: results, TakenAt: time.Now()})
 		st.cycles.Add(1)
-		if !st.started.Load() && allOk(results) {
+		if !st.started.Load() && selfChecksOk(checks, results) {
 			st.started.Store(true)
-			log.infof("startup complete: first fully successful health cycle")
+			log.infof("startup complete: self checks passed")
 		}
 		for name, result := range results {
 			if before, seen := previous[name]; seen && before.OK != result.OK {

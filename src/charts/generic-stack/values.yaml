@@ -220,7 +220,7 @@ components:
   backend:
     image:
       repository: user-mgmt-service
-      tag: "0.0.5"
+      tag: "0.0.6"
     security:
       uid: 10021
       gid: 10021
@@ -244,7 +244,7 @@ components:
   frontend:
     image:
       repository: auth-portal
-      tag: "0.0.2"
+      tag: "0.0.3"
     security:
       uid: 10022
       gid: 10022
@@ -260,7 +260,7 @@ components:
   modules:
     image:
       repository: module-service
-      tag: "0.0.1"
+      tag: "0.0.2"
     security:
       uid: 10024
       gid: 10024

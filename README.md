@@ -43,13 +43,13 @@ is all specified there.
 
 | Folder | Image | Artifact tag | Packaged software (OCI version label) | UID |
 |---|---|---|---|---|
-| src/Backend | user-mgmt-service | 0.0.3 | user_mgmt_service 0.0.1-SNAPSHOT | 10021 |
+| src/Backend | user-mgmt-service | 0.0.6 | user_mgmt_service 0.0.1-SNAPSHOT | 10021 |
 | src/DB | postgresql | 0.0.2 | PostgreSQL 16.15 | 10020 |
-| src/Frontend | auth-portal | 0.0.2 | auth_portal 0.1.0 (static export + Go server) | 10022 |
-| src/Frontend-node | auth-portal | 0.0.2-node | auth_portal 0.1.0 (Node.js runtime variant) | 10022 |
-| src/Modules | module-service | 0.0.1 | module_service 0.1.0 (Nuitka native build, musl, scratch) | 10024 |
+| src/Frontend | auth-portal | 0.0.3 | auth_portal 0.1.0 (static export + Go server) | 10022 |
+| src/Frontend-node | auth-portal | 0.0.3-node | auth_portal 0.1.0 (Node.js runtime variant) | 10022 |
+| src/Modules | module-service | 0.0.2 | module_service 0.1.0 (Nuitka native build, musl, scratch) | 10024 |
 | src/Proxy | traefik | 0.0.3 | Traefik v3.7.13 | 10023 |
-| src/charts/generic-stack | charts/generic-stack | 0.0.5 | — | — |
+| src/charts/generic-stack | charts/generic-stack | 0.0.7 | — | — |
 
 * The **tag is the artifact version** (this repo's build)
 * the **OCI `image.version` label is the packaged software's version**
@@ -70,6 +70,24 @@ iex (Get-Content -Raw buildCommand)      # PowerShell
 
 Both produce the identical multi-arch manifest `localhost/<image>:<tag>`.
 The chart folder's `buildCommand` runs `helm lint` + `helm package`.
+
+## Probes
+
+Every image serves `/startupz`, `/livez` and `/readyz` on its `ADMIN_PORT` from a cached health
+checker, with the same meaning in every image:
+
+| Endpoint | 200 when | Never depends on |
+|---|---|---|
+| `/startupz` | the component's own initialization is done: its self checks passed once (latched) | another component |
+| `/livez` | the checker loop is running (snapshot fresh) | any check result |
+| `/readyz` | self and dependency checks pass, not draining | — |
+
+Each `CONTRACT.md` lists its checks with their kind: **self** (something inside the container that a
+restart resets: the component's own listener, the child it supervises) or **dependency**
+(something outside it that no restart cures: a database, another component of the stack).
+Dependencies gate `/readyz` only. A component whose database or upstream is down keeps running, stays live, drops out
+of load balancing and reconnects by itself, so an outage never turns into restarts that cascade
+through the stack. Only invalid configuration stops a component at startup.
 
 ## Metrics contract
 
@@ -113,7 +131,8 @@ is up, before the application is ready.
 `uri` is always a route template, never the raw path: the backend's `/users/register`,
 `/users/login`, `/users/me`, `/users`, `/users/{id}`, `/users/{id}/modules/{moduleId}`,
 `/modules`; the frontend's `/`, `/login`, `/signup`,
-`/dashboard`, `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/static/**`; the module
+`/dashboard`, `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/api/modules`,
+`/api/users/{id}/modules/{moduleId}`, `/static/**`; the module
 service's `/api/v1/modules`, `/api/v1/modules/{module_id}`, `/openapi.json`, `/docs`,
 `/docs/oauth2-redirect`, `/redoc`. Anything that
 matches no route is `UNKNOWN` (the backend uses Micrometer's own `NOT_FOUND` / `REDIRECTION` /

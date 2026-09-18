@@ -1,10 +1,10 @@
 # auth-portal — image contract
 
 **Default variant.** A Node.js-runtime variant of this image exists at `src/Frontend-node`
-(tag `:0.0.2-node`); this build is the default. Both serve the same metric
+(tag `:0.0.3-node`); this build is the default. Both serve the same metric
 families with the same labels, so swapping the variant changes no dashboard query.
 
-Image: localhost/auth-portal:0.0.2 (auth_portal 0.1.0; retag for your registry — the OCI version
+Image: localhost/auth-portal:0.0.3 (auth_portal 0.1.0; retag for your registry — the OCI version
 label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10022:10022 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (one static Go binary serves the app, the checker loop, the admin
@@ -21,11 +21,22 @@ The upstream server-side features are reproduced by the Go server:
 - the upstream middleware's redirects: `/` -> `/dashboard`; `/dashboard*` without the cookie ->
   `/login`; `/login` with the cookie -> `/dashboard`
 
+It also serves the two routes of the dashboard's Modules view, relayed to the backend with the
+cookie as bearer token, status and body unchanged:
+- `/api/modules` (GET) — the module catalog (the backend's `/modules`)
+- `/api/users/{id}/modules/{moduleId}` (POST subscribes, DELETE unsubscribes; both ids UUIDs,
+  anything else 404) — the backend's route of the same shape, which decides who may change whose
+  subscriptions (the user itself, or `USER_MODIFY`) and answers with the updated user
+
 Source: `github.com/yagan93/auth_portal` @ `599f7f8b0abcac739456d7bd95215c95b26706b6`, cloned during
-the build and patched with `patches/0001-static-export.patch`. The patch enables the static export,
-drops the upstream api routes and middleware (the Go server provides them), routes signup
-same-origin, makes the root page a client redirect, and localizes the third-party CDN asset. The
-server's only dependency beyond the Go standard library is `prometheus/client_golang` (metrics
+the build and patched with `patches/0001-static-export.patch` and
+`patches/0002-module-subscriptions.patch`. The first enables the static export, drops the upstream
+api routes and middleware (the Go server provides them), routes signup same-origin, makes the root
+page a client redirect, and localizes the third-party CDN asset. The second turns the dashboard's
+placeholder content into the Modules view: every module the module service offers as a card with
+subscribe / unsubscribe, the subscription state from `/api/me`'s `moduleIds`, and inline states for
+loading, an empty catalog, an unavailable catalog (retry) and an expired session (log in again).
+The server's only dependency beyond the Go standard library is `prometheus/client_golang` (metrics
 exposition).
 
 ## Ports
@@ -57,12 +68,15 @@ non-zero immediately. One line logs name, version, revision, and the effective c
 the server starts listening.
 
 ## Health checks registered
-| Check       | Verifies                                                                     |
-|-------------|------------------------------------------------------------------------------|
-| static-root | the exported bundle is present and readable (STATIC_DIR/index.html)          |
-| backend-api | `${API_URL}/users` answers ANY HTTP response (reachability; 401/403 count as reachable) |
+| Check       | Kind       | Verifies                                                                     |
+|-------------|------------|------------------------------------------------------------------------------|
+| static-root | self       | the exported bundle is present and readable (STATIC_DIR/index.html)          |
+| backend-api | dependency | `${API_URL}/users` answers ANY HTTP response (reachability; 401/403 count as reachable) |
 
 The checks run concurrently every HEALTH_CHECK_INTERVAL, each bounded by HEALTH_CHECK_TIMEOUT.
+`/startupz` latches on the first cycle in which the self check passes. The dependency check gates
+`/readyz` only, never `/startupz` or `/livez` (snapshot staleness only): an unreachable backend
+takes the frontend out of load balancing, and the container is never restarted for it.
 Probe command: `/app/auth-portal-server healthcheck --endpoint=<startupz|livez|readyz>` (exit 0/1);
 it targets 127.0.0.1 for wildcard binds, otherwise the configured BIND_ADDR.
 
@@ -105,12 +119,13 @@ The backend hop (client side, `peer` is the logical component name, never a host
 
 Label enumerations (a new value is a contract change):
 - `uri` on the server side: `/`, `/login`, `/signup`, `/dashboard` (covers `/dashboard/**`),
-  `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/static/**` (everything under
-  `/_next/` and every other file the exported bundle resolves), `UNKNOWN` (anything else — a scan
-  creates no series). The upstream app has no `/api/users/*` routes; the four `/api/*` routes above
-  are the only proxied ones.
+  `/api/login`, `/api/logout`, `/api/me`, `/api/signup`, `/api/modules`,
+  `/api/users/{id}/modules/{moduleId}`, `/static/**` (everything under `/_next/` and every other
+  file the exported bundle resolves), `UNKNOWN` (anything else — a scan creates no series). The
+  six `/api/*` routes are the only proxied ones.
 - `uri` on the client side: the backend's templates `/users/register`, `/users/login`,
-  `/users/me`, `/users`, `/users/{id}`, else `UNKNOWN`.
+  `/users/me`, `/users`, `/users/{id}`, `/modules`, `/users/{id}/modules/{moduleId}`, else
+  `UNKNOWN`.
 - `method`: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, else `OTHER`.
 - `status`: the numeric status code; `IO_ERROR` on the client side when the backend could not be
   reached. `outcome`: `INFORMATIONAL`, `SUCCESS`, `REDIRECTION`, `CLIENT_ERROR`, `SERVER_ERROR`,
@@ -163,7 +178,8 @@ client IP addresses.
 ## Behavioral notes vs the Node variant
 - Auth redirects happen on full document loads (as with Next middleware); client-side navigations
   are governed by the app's own fetch results, unchanged.
-- Login/logout/me/signup responses mirror the upstream route handlers' status codes and bodies.
+- Login/logout/me/signup responses mirror the upstream route handlers' status codes and bodies;
+  the module routes relay the backend's status and body in both variants.
 - HTTPS to the backend is supported (CA trust bundle baked, `SSL_CERT_FILE` set).
 
 ## Build host requirements
@@ -176,5 +192,5 @@ client IP addresses.
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/auth-portal:0.0.2 docker://<registry>/auth-portal:0.0.2
+  localhost/auth-portal:0.0.3 docker://<registry>/auth-portal:0.0.3
 ```
