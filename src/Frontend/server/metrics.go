@@ -31,17 +31,21 @@ import (
 var latencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 const (
-	routeUnknown = "UNKNOWN"
-	routeStatic  = "/static/**"
-	peerBackend  = "backend"
+	routeUnknown            = "UNKNOWN"
+	routeStatic             = "/static/**"
+	routeModuleSubscription = "/api/users/{id}/modules/{moduleId}"
+	peerBackend             = "backend"
 )
 
 // Route classes of the main listener, in match order.
-var namedRoutes = []string{"/", "/login", "/signup", "/dashboard", "/api/login", "/api/logout", "/api/me", "/api/signup"}
+var namedRoutes = []string{"/", "/login", "/signup", "/dashboard", "/api/login", "/api/logout", "/api/me", "/api/signup", "/api/modules"}
 
 // Backend route templates the proxied calls map to (the backend's own `uri`
-// values, so both ends of the hop carry the same label).
-var backendRoutes = []string{"/users/register", "/users/login", "/users/me", "/users", "/users/{id}"}
+// values, so both ends of the hop carry the same label): the exact ones, then
+// the ones with ids.
+var backendRoutes = []string{"/users/register", "/users/login", "/users/me", "/users", "/modules"}
+
+var backendIDRoutes = []string{"/users/{id}", "/users/{id}/modules/{moduleId}"}
 
 var knownMethods = map[string]bool{"GET": true, "HEAD": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "OPTIONS": true}
 
@@ -100,11 +104,11 @@ func newMetrics(cfg *config, st *state) *metrics {
 	)
 	// Counters exist from the first scrape for every route class, so rate()
 	// works before the first request and the enumeration is visible.
-	for _, route := range append(append([]string{}, namedRoutes...), routeStatic, routeUnknown) {
+	for _, route := range append(append([]string{}, namedRoutes...), routeModuleSubscription, routeStatic, routeUnknown) {
 		m.serverReqBytes.WithLabelValues(route)
 		m.serverRespBytes.WithLabelValues(route)
 	}
-	for _, route := range append(append([]string{}, backendRoutes...), routeUnknown) {
+	for _, route := range append(append(append([]string{}, backendRoutes...), backendIDRoutes...), routeUnknown) {
 		m.clientReqBytes.WithLabelValues(peerBackend, route)
 		m.clientRespBytes.WithLabelValues(peerBackend, route)
 	}
@@ -281,6 +285,12 @@ func routeClass(cfg *config, requestPath string) string {
 			return route
 		}
 	}
+	if rest, ok := strings.CutPrefix(clean, "/api/users/"); ok {
+		id, moduleID, found := strings.Cut(rest, "/modules/")
+		if found && uuidPattern.MatchString(id) && uuidPattern.MatchString(moduleID) {
+			return routeModuleSubscription
+		}
+	}
 	if strings.HasPrefix(clean, "/dashboard/") {
 		return "/dashboard"
 	}
@@ -315,13 +325,19 @@ func resolveStatic(staticDir, clean string) (string, bool) {
 // backendRoute maps a backend request path to the backend's route template.
 func backendRoute(requestPath string) string {
 	clean := path.Clean("/" + requestPath)
-	for _, route := range backendRoutes[:4] {
+	for _, route := range backendRoutes {
 		if clean == route {
 			return route
 		}
 	}
-	if rest, ok := strings.CutPrefix(clean, "/users/"); ok && uuidPattern.MatchString(rest) {
-		return "/users/{id}"
+	if rest, ok := strings.CutPrefix(clean, "/users/"); ok {
+		id, moduleID, nested := strings.Cut(rest, "/modules/")
+		switch {
+		case !nested && uuidPattern.MatchString(rest):
+			return "/users/{id}"
+		case nested && uuidPattern.MatchString(id) && uuidPattern.MatchString(moduleID):
+			return "/users/{id}/modules/{moduleId}"
+		}
 	}
 	return routeUnknown
 }

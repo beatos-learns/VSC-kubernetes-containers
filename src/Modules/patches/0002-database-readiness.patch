@@ -1,0 +1,44 @@
+diff --git a/app/ops/health.py b/app/ops/health.py
+index f91e0ff..d0385c0 100644
+--- a/app/ops/health.py
++++ b/app/ops/health.py
+@@ -162,7 +162,11 @@ class HealthState:
+ 
+ 
+ class Checker:
+-    """Runs every registered check concurrently in its own threads, each bounded by the timeout."""
++    """Runs every registered check concurrently in its own threads, each bounded by the timeout.
++
++    The checks are the service's dependencies: they gate readiness only. Startup completes
++    with the first cycle, so an unreachable database never holds startup back.
++    """
+ 
+     def __init__(self, cfg: OpsConfig, state: HealthState, checks: list[Check]) -> None:
+         self.cfg = cfg
+@@ -211,9 +215,9 @@ class Checker:
+         results = {check.name: result for check, result in zip(self.checks, outcomes, strict=True)}
+         self.state.snapshot = Snapshot(results, time.monotonic(), time.time())
+         self.state.cycles += 1
+-        if not self.state.started and all(result.ok for result in results.values()):
++        if not self.state.started:
+             self.state.started = True
+-            log(logger, "info", "startup complete: first fully successful health cycle")
++            log(logger, "info", "startup complete: listeners up, first health cycle done")
+         for name, result in results.items():
+             before = previous.get(name)
+             if before is not None and before.ok != result.ok:
+diff --git a/app/ops/server.py b/app/ops/server.py
+index 22965d1..2c1b9ad 100644
+--- a/app/ops/server.py
++++ b/app/ops/server.py
+@@ -228,9 +228,9 @@ async def serve(
+     )
+ 
+     await admin_server.startup()
++    await main_server.startup()
+     checker = Checker(cfg, state, database_checks(engine))
+     checker_task = asyncio.create_task(checker.loop(), name="health-checker")
+-    await main_server.startup()
+     config_line = " ".join(f"{key}={value}" for key, value in redacted.items())
+     log(
+         logger,

@@ -1,6 +1,6 @@
 # module-service — image contract
 
-Image: localhost/module-service:0.0.1 (module_service 0.1.0; retag for your registry — the OCI version
+Image: localhost/module-service:0.0.2 (module_service 0.1.0; retag for your registry — the OCI version
 label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10024:10024 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (one native executable serves the API, the checker loop, the admin
@@ -50,9 +50,10 @@ package (env configuration, ECS JSON logging, OpenMetrics registry, cached healt
 listener, route instrumentation, probe command, drain sequence), `app/__main__.py` as the entry
 point, `DATABASE_URL_FILE`, `MYSQL_SSL_MODE`/`MYSQL_SSL_CA` and the pool knobs in `app/config.py`
 and `app/database.py` (the upstream boolean `MYSQL_SSL_DISABLED` became the `MYSQL_SSL_MODE`
-enumeration), and the removal of upstream's `logging.basicConfig`. The REST API, models, schemas
-and repository are unchanged. Dependencies come from the upstream `uv.lock` (hash-verified,
-`uv sync --frozen`) with one change made by the patch: `starlette` is constrained to
+enumeration), and the removal of upstream's `logging.basicConfig`; then with
+`patches/0002-database-readiness.patch` (startup completes without the database, see Health
+checks). The REST API, models, schemas and repository are unchanged. Dependencies come from the
+upstream `uv.lock` (hash-verified, `uv sync --frozen`) with one change made by `0001`: `starlette` is constrained to
 `>=1.3.1,<2` and re-locked (0.52.1 → 1.6.0), because the locked 0.52.1 carries fixed
 vulnerabilities the CI scan gate rejects; FastAPI 0.141.1 allows any Starlette `>=0.46`.
 `watchfiles`, `websockets`, `pyyaml` and `greenlet` of the lock are not installed (reload
@@ -68,7 +69,7 @@ records the exact versions). Nuitka and patchelf are build-stage tools pinned by
 ```json contract-facts
 {
   "contract_version": 1,
-  "image": {"name": "localhost/module-service", "version": "0.0.1"},
+  "image": {"name": "localhost/module-service", "version": "0.0.2"},
   "identity": {"uid": 10024, "gid": 10024},
   "ports": {"http": 8080, "admin": 9090},
   "probes": {"port": "admin", "startup": "/startupz", "liveness": "/livez",
@@ -124,16 +125,18 @@ masked) once both listeners are up. Upstream's `.env` file support stays in the 
 file exists in the image (the working directory is `/`).
 
 ## Health checks registered
-| Check    | Verifies                                                                              |
-|----------|---------------------------------------------------------------------------------------|
-| database | `SELECT 1` through the connection pool: the MySQL is reachable and authenticates      |
-| schema   | `SELECT 1 FROM modules LIMIT 1`: the upstream `schema.sql` has been applied (the service runs no migrations) |
+| Check    | Kind       | Verifies                                                                              |
+|----------|------------|---------------------------------------------------------------------------------------|
+| database | dependency | `SELECT 1` through the connection pool: the MySQL is reachable and authenticates      |
+| schema   | dependency | `SELECT 1 FROM modules LIMIT 1`: the upstream `schema.sql` has been applied (the service runs no migrations) |
 
 Both run concurrently every HEALTH_CHECK_INTERVAL in dedicated threads, each bounded by
 HEALTH_CHECK_TIMEOUT; a check whose previous run is still stuck is reported failed instead of
-piling up threads. `/startupz` latches on the first cycle in which both pass, so a database that
-is unreachable at boot delays startup completion (size the startup probe budget accordingly).
-Both gate `/readyz`; neither ever gates `/livez` (snapshot staleness only). Transitions are
+piling up threads. The checker starts once both listeners are up, and `/startupz` latches on its
+first completed cycle, whatever the checks report: the database is never a startup condition.
+Both checks gate `/readyz` only, never `/startupz` or `/livez` (snapshot staleness only): an
+unreachable MySQL, refused credentials or a missing schema take the pod out of load balancing,
+the container is never restarted for it, and the pool reconnects by itself. Transitions are
 logged: `health check 'database' transitioned True -> False (...)` and
 `readiness True -> False (failing checks: [...])`. `?verbose=1` on any probe returns the
 per-check JSON (status, detail, duration, last success).
@@ -260,30 +263,31 @@ error · 2 unknown command-line argument · 3 a listener could not bind (startup
 
 ## Verification status
 Verified on linux/amd64 with the delivered image (115.7 MB, 139 files, 72 shared objects)
-against a MySQL 8.4 container carrying the upstream `schema.sql`, under `--read-only
---cap-drop=ALL --security-opt=no-new-privileges --user 10024:10024` with a tmpfs `/tmp`:
-- startup: both listeners up about 1.8 s after process start, `/startupz` latched 0.1 s later
-  on the first check cycle; the probe command for all three endpoints (exit 0, exit 1 for an
-  unknown endpoint); `?verbose=1` bodies
-- `/metrics`: the media type, `# HELP`/`# TYPE` per family, `# EOF`, every family of the tables
-  above present, the shared bucket boundaries
-- the CRUD round trip with the upstream status codes (201, 409, 200, 404, 422, 204, 405, and 200
-  for `/docs` and `/openapi.json`), route templates and `UNKNOWN` in the `uri` label, the
-  `insert` error counter on a duplicate code, request-id echo and its correlation into the
-  access log, password masking in the startup line, every log line parseable JSON
-- readiness 503 with liveness 200 while the database container is stopped, both transitions
-  logged, recovery once it is back
-- SIGTERM: readiness 503 while the main listener still answers during the drain delay, exit 0
-  inside the grace period
-- all five TLS modes against MySQL's auto-generated certificate (`disabled` on plain TCP,
-  `preferred`, `required` and `verify-ca` over TLS, `verify-identity` rejecting the
-  certificate's host-name mismatch), `caching_sha2_password` authentication in every mode
-- fail-fast: five invalid configurations exit 1 with one `fatal configuration error` line, an
-  unknown argument exits 2
+against a MySQL 8.4 container, under `--read-only --cap-drop=ALL
+--security-opt=no-new-privileges` (image user 10024) with a tmpfs `/tmp`:
+- startup without a database (the MySQL host name does not even resolve): `/startupz` and
+  `/livez` 200, `/readyz` 503 with the cause in `?verbose=1`, the probe command exit 0 / 0 / 1
+  (exit 1 for an unknown endpoint), no restart; a MySQL without the schema keeps `/readyz` at
+  503 (`schema` failing) until `schema.sql` is applied, ready 2 s later
+- readiness 503 with liveness 200 within a second of the database container stopping, both
+  transitions logged, ready again 4 s after it is back
+- `/metrics`: the media type, `# EOF`, `build_info`, `health_check_up` per check
+- the CRUD round trip with the upstream status codes (201, 409, 200, 404, 422, 204, 405)
+- SIGTERM: exit 0 inside the grace period; every log line parseable JSON
+- fail-fast: invalid configurations exit 1 with one `fatal configuration error` line, an unknown
+  argument exits 2
 - the exported image tree: no shell, no package manager, no interpreter, no `.py`; the
-  CI-equivalent Trivy gate (HIGH+CRITICAL, unfixed ignored) and a full-severity scan report zero
-  findings for the 12 OS and 22 Python packages, syft lists all 34
-- idle footprint after the round trip: 78 MB RSS
+  CI-equivalent Trivy gate (HIGH+CRITICAL, unfixed ignored) passes
+Verified with the 0.0.1 build, whose file tree and code paths this image shares except for when
+startup completes and when the checker starts: the five TLS modes against MySQL's
+auto-generated certificate (`disabled` on plain TCP, `preferred`, `required` and `verify-ca`
+over TLS, `verify-identity` rejecting the certificate's host-name mismatch) with
+`caching_sha2_password` authentication in every mode, `# HELP`/`# TYPE` for every family of the
+tables above and the shared bucket boundaries, route templates and `UNKNOWN` in the `uri` label,
+the `insert` error counter on a duplicate code, request-id echo and its correlation into the
+access log, password masking in the startup line, readiness 503 while the main listener still
+answers during the drain delay, a full-severity scan with zero findings for the 12 OS and 22
+Python packages (syft lists all 34), and the idle footprint after the round trip (78 MB RSS).
 Build-stage gates shown red on violating trees: the library closure on a dist without `libz`,
 the C-API gate on an executable linked without `-Wl,--export-dynamic` (721 unresolved symbols).
 Blind spots: the linux/arm64 image was not built or run on this host (no emulation in the build
@@ -296,5 +300,5 @@ Swagger assets come from a CDN).
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/module-service:0.0.1 docker://<registry>/module-service:0.0.1
+  localhost/module-service:0.0.2 docker://<registry>/module-service:0.0.2
 ```

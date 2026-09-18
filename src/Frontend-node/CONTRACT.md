@@ -5,7 +5,7 @@ compiled Go server, no Node runtime, ~10x smaller). Use this variant only when t
 server runtime is explicitly wanted. Both variants serve the same metric families, label
 enumerations, histogram buckets and log shape, so swapping the variant changes no dashboard query.
 
-Image: localhost/auth-portal:0.0.2-node (auth_portal 0.1.0; retag for your registry — the OCI
+Image: localhost/auth-portal:0.0.3-node (auth_portal 0.1.0; retag for your registry — the OCI
 version label keeps the packaged-software version, the tag is the artifact version)
 UID:GID baked: 10022:10022 (ad-hoc assignment; override with `--build-arg APP_UID/APP_GID`)
 Checker topology: in-process (`ops/bootstrap.cjs` runs the Next.js standalone server, the checker
@@ -22,7 +22,13 @@ build-time-inlined `NEXT_PUBLIC_API_URL`), the signup call is proxied through `/
 browser only ever talks same-origin, the jwt cookie `secure` flag is env-derived (`COOKIE_SECURE`),
 the avatar is a local asset instead of a third-party CDN one, `output: 'standalone'` is enabled, and
 `package.json` plus the pnpm lockfile pin next 16.3.5 (with sharp 0.35.4) in place of the upstream
-next 16.2.4.
+next 16.2.4. `patches/0002-module-subscriptions.patch` adds the dashboard's Modules view (the same
+view and the same same-origin routes as the default variant, see `src/Frontend/CONTRACT.md`) with
+the route handlers `/api/modules` (GET) and `/api/users/[id]/modules/[moduleId]` (POST subscribes,
+DELETE unsubscribes; both ids UUIDs, anything else 404), which relay to the backend with the jwt
+cookie as bearer token, status and body unchanged. `patches/0003-signup-route.patch` adds the
+`/api/signup` route handler the signup page posts to (relayed to the backend's `/users/register`,
+status and body unchanged), which upstream never had.
 
 Base: `gcr.io/distroless/nodejs24-debian13` (digest-pinned) — documented exception to the base
 policy: a purpose-built runtime image chosen for the Node.js environment it ships. The final image
@@ -56,10 +62,14 @@ non-zero immediately. One line logs name, version, revision, and the effective c
 the server starts listening.
 
 ## Health checks registered
-| Check       | Verifies                                                                     |
-|-------------|------------------------------------------------------------------------------|
-| next-server | the Next.js HTTP listener is up in this process                              |
-| backend-api | `${API_URL}/users` answers ANY HTTP response (reachability; 401/403 count as reachable) |
+| Check       | Kind       | Verifies                                                                     |
+|-------------|------------|------------------------------------------------------------------------------|
+| next-server | self       | the Next.js HTTP listener is up in this process                              |
+| backend-api | dependency | `${API_URL}/users` answers ANY HTTP response (reachability; 401/403 count as reachable) |
+
+`/startupz` latches on the first cycle in which the self check passes. The dependency check gates
+`/readyz` only, never `/startupz` or `/livez` (snapshot staleness only): an unreachable backend
+takes the frontend out of load balancing, and the container is never restarted for it.
 
 Probe command: `/nodejs/bin/node /app/ops/probe.cjs --endpoint=<startupz|livez|readyz>` (exit 0/1);
 it targets 127.0.0.1 for wildcard binds, otherwise the configured BIND_ADDR.
@@ -124,10 +134,11 @@ Label enumerations (fixed; a new value is a contract change):
 
 - `uri` (server side) is the route class, never the raw path: `/`, `/login`, `/signup`,
   `/dashboard` (also `/dashboard/**`), `/api/login`, `/api/logout`, `/api/me`, `/api/signup`,
-  `/static/**` (everything under `/_next/`, `/favicon.ico`, and the files of the bundle's
-  `public/` directory), `UNKNOWN` for anything else — a scan cannot create series.
+  `/api/modules`, `/api/users/{id}/modules/{moduleId}`, `/static/**` (everything under `/_next/`,
+  `/favicon.ico`, and the files of the bundle's `public/` directory), `UNKNOWN` for anything else
+  — a scan cannot create series.
 - `uri` (client side) is the backend's route template: `/users/register`, `/users/login`,
-  `/users/me`, `/users`, `/users/{id}`, `UNKNOWN`.
+  `/users/me`, `/users`, `/users/{id}`, `/modules`, `/users/{id}/modules/{moduleId}`, `UNKNOWN`.
 - `status`: the numeric HTTP status; server side `0` when the client went away before a response
   was sent; client side `IO_ERROR` when the call failed before a response arrived.
 - `outcome`: `INFORMATIONAL`, `SUCCESS`, `REDIRECTION`, `CLIENT_ERROR`, `SERVER_ERROR`, `UNKNOWN`.
@@ -183,5 +194,5 @@ logger exists.
 ## Publishing
 ```
 podman manifest push --all --compression-format zstd:chunked --compression-level 19 --format oci \
-  localhost/auth-portal:0.0.2-node docker://<registry>/auth-portal:0.0.2-node
+  localhost/auth-portal:0.0.3-node docker://<registry>/auth-portal:0.0.3-node
 ```

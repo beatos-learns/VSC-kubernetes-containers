@@ -13,8 +13,9 @@ import (
 
 // The application handlers: the four server-side auth endpoints upstream
 // implemented as Next route handlers (login/logout/me/signup, proxying to the
-// backend with the httpOnly jwt cookie) and the static bundle with the
-// upstream middleware's redirects.
+// backend with the httpOnly jwt cookie), the module catalog and the module
+// subscriptions of the dashboard, and the static bundle with the upstream
+// middleware's redirects.
 
 func newAppHandler(cfg *config, log *logger, m *metrics) http.Handler {
 	client := &http.Client{Timeout: cfg.apiTimeout, Transport: &instrumentedTransport{m: m, next: http.DefaultTransport}}
@@ -23,6 +24,10 @@ func newAppHandler(cfg *config, log *logger, m *metrics) http.Handler {
 	mux.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) { handleLogout(cfg, w, r) })
 	mux.HandleFunc("/api/me", func(w http.ResponseWriter, r *http.Request) { handleMe(cfg, client, w, r) })
 	mux.HandleFunc("/api/signup", func(w http.ResponseWriter, r *http.Request) { handleSignup(cfg, client, w, r) })
+	mux.HandleFunc("/api/modules", func(w http.ResponseWriter, r *http.Request) { handleModules(cfg, client, w, r) })
+	mux.HandleFunc("/api/users/{id}/modules/{moduleId}", func(w http.ResponseWriter, r *http.Request) {
+		handleModuleSubscription(cfg, client, w, r)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { handleStatic(cfg, w, r) })
 	return instrument(cfg, log, m, mux)
 }
@@ -145,6 +150,58 @@ func handleSignup(cfg *config, client *http.Client, w http.ResponseWriter, r *ht
 	}
 	defer response.Body.Close()
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, _ = io.Copy(w, response.Body)
+}
+
+// handleModules lists the modules the backend offers (any signed-in user).
+func handleModules(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
+		return
+	}
+	relayWithToken(cfg, client, w, r, http.MethodGet, "/modules")
+}
+
+// handleModuleSubscription subscribes (POST) or unsubscribes (DELETE) a user
+// to a module; the backend decides who may (the user itself or USER_MODIFY)
+// and answers with the updated user.
+func handleModuleSubscription(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "Method not allowed"})
+		return
+	}
+	id, moduleID := r.PathValue("id"), r.PathValue("moduleId")
+	if !uuidPattern.MatchString(id) || !uuidPattern.MatchString(moduleID) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"message": "Not found"})
+		return
+	}
+	relayWithToken(cfg, client, w, r, r.Method, "/users/"+id+"/modules/"+moduleID)
+}
+
+// relayWithToken calls the backend with the jwt cookie as bearer token and
+// relays its status and body unchanged.
+func relayWithToken(cfg *config, client *http.Client, w http.ResponseWriter, r *http.Request, method, route string) {
+	cookie, err := r.Cookie("jwt")
+	if err != nil || cookie.Value == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), method, cfg.apiURL+route, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"message": "Server error"})
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+cookie.Value)
+	response, err := client.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"message": "Backend unreachable"})
+		return
+	}
+	defer response.Body.Close()
+	if contentType := response.Header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
 	w.WriteHeader(response.StatusCode)
 	_, _ = io.Copy(w, response.Body)
 }
